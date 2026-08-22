@@ -1,0 +1,8 @@
+node_modules
+backend/pharmacy.db
+.env
+dist
+backend/.env
+backend/prisma/dev.db
+backend/prisma/dev.db-journal
+tmp/

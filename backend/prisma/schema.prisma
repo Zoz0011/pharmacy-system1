@@ -1,0 +1,541 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Workspace {
+  id                   Int      @id @default(autoincrement())
+  name                 String
+  stagnantAlertEnabled Boolean  @default(true)
+  stagnantAlertDays    Int      @default(7)
+  expiryAlertDays      Int      @default(30)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  users                User[]
+  suppliers            Supplier[]
+  customers            Customer[]
+  medicines            Medicine[]
+  sales                Sale[]
+  cashierShifts        CashierShift[]
+  inventoryCounts      InventoryCount[]
+  stockMovements       StockMovement[]
+  purchaseInvoices     PurchaseInvoice[]
+  shiftExpenses        ShiftExpense[]
+  treasuryAccounts     TreasuryAccount[]
+  treasuryTransactions TreasuryTransaction[]
+  accountingAccounts   AccountingAccount[]
+  accountingEntries    AccountingEntry[]
+}
+
+model User {
+  id                     Int       @id @default(autoincrement())
+  name                   String
+  username               String?   @unique
+  email                  String    @unique
+  password               String
+  passwordResetCodeHash  String?
+  passwordResetExpiresAt DateTime?
+  role                   String    @default("PHARMACIST")
+  phone                  String?
+  alternatePhone         String?
+  telephone              String?
+  jobTitle               String?
+  department             String?
+  salary                 Float     @default(0)
+  hireDate               DateTime?
+  nationalId             String?
+  addressLine1           String?
+  addressLine2           String?
+  district               String?
+  city                   String?
+  state                  String?
+  country                String?
+  postalCode             String?
+  active                 Boolean   @default(true)
+  customFields           String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+  workspaceId            Int       @default(1)
+  workspace              Workspace @relation(fields: [workspaceId], references: [id])
+
+  sales                       Sale[]
+  stockMovements              StockMovement[]
+  cashierShifts               CashierShift[]
+  customerAccountTransactions CustomerAccountTransaction[]
+  inventoryCounts             InventoryCount[]
+  shiftExpenses               ShiftExpense[]
+  accountingAccounts          AccountingAccount[]          @relation("AccountingAccountCreator")
+  accountingEntries           AccountingEntry[]            @relation("AccountingEntryCreator")
+}
+
+model Supplier {
+  id               Int       @id @default(autoincrement())
+  name             String
+  phone            String?
+  email            String?
+  address          String?
+  supplierType     String    @default("BUSINESS")
+  contactRole      String    @default("SUPPLIER")
+  businessName     String?
+  familyName       String?
+  middleName       String?
+  title            String?
+  alternatePhone   String?
+  telephone        String?
+  taxNumber        String?
+  openingBalance   Float     @default(0)
+  paymentTermValue Int?
+  paymentTermUnit  String?
+  contactCode      String?
+  addressLine1     String?
+  addressLine2     String?
+  district         String?
+  city             String?
+  state            String?
+  country          String?
+  postalCode       String?
+  shippingAddress  String?
+  customFields     String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  workspaceId      Int       @default(1)
+  workspace        Workspace @relation(fields: [workspaceId], references: [id])
+  linkedCustomerId Int?      @unique
+  linkedCustomer   Customer? @relation("CustomerSupplierContact", fields: [linkedCustomerId], references: [id])
+
+  medicines        Medicine[]
+  purchaseInvoices PurchaseInvoice[]
+  sales             Sale[]
+
+  @@index([workspaceId, contactCode])
+}
+
+model Customer {
+  id               Int       @id @default(autoincrement())
+  name             String
+  phone            String?
+  address          String?
+  customerType     String    @default("PERSON")
+  contactRole      String    @default("CUSTOMER")
+  businessName     String?
+  familyName       String?
+  middleName       String?
+  title            String?
+  email            String?
+  alternatePhone   String?
+  telephone        String?
+  taxNumber        String?
+  openingBalance   Float     @default(0)
+  paymentTermValue Int?
+  paymentTermUnit  String?
+  contactCode      String?
+  addressLine1     String?
+  addressLine2     String?
+  district         String?
+  city             String?
+  state            String?
+  country          String?
+  postalCode       String?
+  shippingAddress  String?
+  customFields     String?
+  creditLimit      Float     @default(0)
+  accountBalance   Float     @default(0)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  workspaceId      Int       @default(1)
+  workspace        Workspace @relation(fields: [workspaceId], references: [id])
+  supplierProfile  Supplier? @relation("CustomerSupplierContact")
+
+  sales               Sale[]
+  accountTransactions CustomerAccountTransaction[]
+
+  @@index([workspaceId, contactCode])
+}
+
+model Medicine {
+  id                Int       @id @default(autoincrement())
+  name              String
+  nameAr            String?
+  nameEn            String?
+  searchAliases     String?
+  itemType          String    @default("MEDICINE")
+  packageNameAr     String?
+  packageNameEn     String?
+  pieceNameAr       String?
+  pieceNameEn       String?
+  stockUnit         String?
+  barcode           String?
+  category          String?
+  manufacturer      String?
+  description       String?
+  purchasePrice     Float
+  sellingPrice      Float
+  quantity          Int       @default(0)
+  minStock          Int       @default(5)
+  stripsPerBox      Int       @default(1)
+  pillsPerStrip     Int       @default(1)
+  stripSellingPrice Float?
+  pillSellingPrice  Float?
+  expiryDate        DateTime?
+  batchNumber       String?
+  supplierId        Int?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  workspaceId       Int       @default(1)
+  workspace         Workspace @relation(fields: [workspaceId], references: [id])
+
+  supplier             Supplier?             @relation(fields: [supplierId], references: [id])
+  saleItems            SaleItem[]
+  stockMovements       StockMovement[]
+  purchaseInvoiceItems PurchaseInvoiceItem[]
+  medicineBoxes        MedicineBox[]
+  inventoryCountItems  InventoryCountItem[]
+
+  @@unique([workspaceId, barcode])
+}
+
+model Sale {
+  id             Int       @id @default(autoincrement())
+  invoiceNumber  String    @unique
+  totalAmount    Float
+  discount       Float     @default(0)
+  finalAmount    Float
+  refundedAmount Float     @default(0)
+  status         String    @default("COMPLETED")
+  paymentMethod  String    @default("CASH")
+  counterpartyType String  @default("CASH")
+  createdAt      DateTime  @default(now())
+  returnedAt     DateTime?
+  workspaceId    Int       @default(1)
+  workspace      Workspace @relation(fields: [workspaceId], references: [id])
+
+  userId         Int
+  customerId     Int?
+  supplierId     Int?
+  cashierShiftId Int?
+
+  user                User                         @relation(fields: [userId], references: [id])
+  customer            Customer?                    @relation(fields: [customerId], references: [id])
+  supplier            Supplier?                    @relation(fields: [supplierId], references: [id])
+  cashierShift        CashierShift?                @relation(fields: [cashierShiftId], references: [id])
+  items               SaleItem[]
+  accountTransactions CustomerAccountTransaction[]
+
+  @@index([workspaceId, createdAt])
+}
+
+model CashierShift {
+  id           Int       @id @default(autoincrement())
+  status       String    @default("OPEN")
+  openingCash  Float     @default(0)
+  expectedCash Float     @default(0)
+  countedCash  Float?
+  difference   Float     @default(0)
+  notes        String?
+  openedAt     DateTime  @default(now())
+  closedAt     DateTime?
+  workspaceId  Int       @default(1)
+  workspace    Workspace @relation(fields: [workspaceId], references: [id])
+
+  userId               Int
+  user                 User                         @relation(fields: [userId], references: [id])
+  sales                Sale[]
+  expenses             ShiftExpense[]
+  customerTransactions CustomerAccountTransaction[]
+
+  @@index([userId, status])
+  @@index([openedAt])
+}
+
+model ShiftExpense {
+  id             Int          @id @default(autoincrement())
+  category       String       @default("GENERAL")
+  amount         Float
+  paymentMethod  String       @default("CASH")
+  note           String?
+  createdAt      DateTime     @default(now())
+  workspaceId    Int
+  workspace      Workspace    @relation(fields: [workspaceId], references: [id])
+  cashierShiftId Int
+  cashierShift   CashierShift @relation(fields: [cashierShiftId], references: [id])
+  userId         Int
+  user           User         @relation(fields: [userId], references: [id])
+
+  @@index([cashierShiftId, createdAt])
+  @@index([workspaceId, createdAt])
+}
+
+model CustomerAccountTransaction {
+  id           Int      @id @default(autoincrement())
+  type         String
+  amount       Float
+  balanceAfter Float
+  note         String?
+  createdAt    DateTime @default(now())
+
+  customerId     Int
+  userId         Int
+  saleId         Int?
+  cashierShiftId Int?
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  user         User          @relation(fields: [userId], references: [id])
+  sale         Sale?         @relation(fields: [saleId], references: [id])
+  cashierShift CashierShift? @relation(fields: [cashierShiftId], references: [id])
+
+  @@index([customerId, createdAt])
+}
+
+model InventoryCount {
+  id          Int       @id @default(autoincrement())
+  countNumber String    @unique
+  status      String    @default("OPEN")
+  notes       String?
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+
+  createdById Int
+  createdBy   User                 @relation(fields: [createdById], references: [id])
+  items       InventoryCountItem[]
+
+  @@index([status, createdAt])
+}
+
+model InventoryCountItem {
+  id               Int       @id @default(autoincrement())
+  expectedQuantity Int
+  countedQuantity  Int?
+  difference       Int?
+  note             String?
+  countedAt        DateTime?
+
+  inventoryCountId Int
+  medicineId       Int
+
+  inventoryCount InventoryCount @relation(fields: [inventoryCountId], references: [id], onDelete: Cascade)
+  medicine       Medicine       @relation(fields: [medicineId], references: [id])
+
+  @@unique([inventoryCountId, medicineId])
+  @@index([inventoryCountId])
+}
+
+model SaleItem {
+  id            Int     @id @default(autoincrement())
+  quantity      Int
+  saleUnit      String  @default("BOX")
+  baseUnits     Int     @default(0)
+  baseUnitPrice Float?
+  unitPrice     Float
+  discountType  String?
+  discountValue Float   @default(0)
+  note          String?
+  totalPrice    Float
+
+  saleId     Int
+  medicineId Int
+
+  sale        Sale                @relation(fields: [saleId], references: [id])
+  medicine    Medicine            @relation(fields: [medicineId], references: [id])
+  allocations BoxSaleAllocation[]
+}
+
+model StockMovement {
+  id             Int       @id @default(autoincrement())
+  type           String
+  quantityChange Int
+  quantityAfter  Int
+  reason         String?
+  note           String?
+  createdAt      DateTime  @default(now())
+  workspaceId    Int       @default(1)
+  workspace      Workspace @relation(fields: [workspaceId], references: [id])
+
+  medicineId Int
+  userId     Int?
+
+  medicine Medicine @relation(fields: [medicineId], references: [id])
+  user     User?    @relation(fields: [userId], references: [id])
+}
+
+model PurchaseInvoice {
+  id            Int       @id @default(autoincrement())
+  invoiceNumber String    @unique
+  totalAmount   Float
+  paymentStatus String    @default("PENDING")
+  status        String    @default("COMPLETED")
+  notes         String?
+  createdAt     DateTime  @default(now())
+  returnedAt    DateTime?
+  workspaceId   Int       @default(1)
+  workspace     Workspace @relation(fields: [workspaceId], references: [id])
+
+  supplierId Int?
+
+  supplier Supplier?             @relation(fields: [supplierId], references: [id])
+  items    PurchaseInvoiceItem[]
+}
+
+model PurchaseInvoiceItem {
+  id            Int   @id @default(autoincrement())
+  quantity      Int
+  baseUnits     Int   @default(0)
+  purchasePrice Float
+  sellingPrice  Float
+  totalPrice    Float
+
+  purchaseInvoiceId Int
+  medicineId        Int
+
+  purchaseInvoice PurchaseInvoice @relation(fields: [purchaseInvoiceId], references: [id])
+  medicine        Medicine        @relation(fields: [medicineId], references: [id])
+  medicineBoxes   MedicineBox[]
+}
+
+model MedicineBox {
+  id             Int       @id @default(autoincrement())
+  boxCode        String    @unique
+  totalPills     Int
+  remainingPills Int
+  stripsPerBox   Int
+  pillsPerStrip  Int
+  batchNumber    String?
+  expiryDate     DateTime?
+  status         String    @default("OPEN")
+  createdAt      DateTime  @default(now())
+  depletedAt     DateTime?
+
+  medicineId            Int
+  purchaseInvoiceItemId Int?
+
+  medicine            Medicine             @relation(fields: [medicineId], references: [id])
+  purchaseInvoiceItem PurchaseInvoiceItem? @relation(fields: [purchaseInvoiceItemId], references: [id])
+  allocations         BoxSaleAllocation[]
+}
+
+model BoxSaleAllocation {
+  id           Int      @id @default(autoincrement())
+  saleUnit     String
+  saleQuantity Int
+  baseUnits    Int
+  createdAt    DateTime @default(now())
+
+  saleItemId    Int
+  medicineBoxId Int
+
+  saleItem    SaleItem    @relation(fields: [saleItemId], references: [id])
+  medicineBox MedicineBox @relation(fields: [medicineBoxId], references: [id])
+}
+
+model TreasuryAccount {
+  id          Int      @id @default(autoincrement())
+  name        String
+  balance     Float    @default(0)
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  workspaceId Int      @default(1)
+
+  workspace    Workspace             @relation(fields: [workspaceId], references: [id])
+  transactions TreasuryTransaction[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, isDefault])
+}
+
+model TreasuryTransaction {
+  id                Int      @id @default(autoincrement())
+  type              String
+  direction         String
+  amount            Float
+  balanceAfter      Float
+  paymentMethod     String?
+  note              String?
+  referenceType     String?
+  referenceId       Int?
+  referenceNumber   String?
+  userId            Int?
+  cashierShiftId    Int?
+  createdAt         DateTime @default(now())
+  workspaceId       Int      @default(1)
+  treasuryAccountId Int
+
+  workspace       Workspace       @relation(fields: [workspaceId], references: [id])
+  treasuryAccount TreasuryAccount @relation(fields: [treasuryAccountId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+  @@index([treasuryAccountId, createdAt])
+  @@index([referenceType, referenceId])
+  @@index([cashierShiftId])
+}
+
+model AccountingAccount {
+  id             Int      @id @default(autoincrement())
+  name           String
+  accountNumber  String
+  accountType    String
+  subType        String?
+  nature         String
+  openingBalance Float    @default(0)
+  balance        Float    @default(0)
+  note           String?
+  details        String?
+  systemKey      String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  workspaceId    Int      @default(1)
+  createdById    Int?
+
+  workspace Workspace             @relation(fields: [workspaceId], references: [id])
+  createdBy User?                 @relation("AccountingAccountCreator", fields: [createdById], references: [id])
+  lines     AccountingEntryLine[]
+
+  @@unique([workspaceId, accountNumber])
+  @@unique([workspaceId, systemKey])
+  @@index([workspaceId, accountType, active])
+}
+
+model AccountingEntry {
+  id              Int      @id @default(autoincrement())
+  entryNumber     String
+  entryType       String   @default("MANUAL")
+  entryDate       DateTime @default(now())
+  description     String?
+  referenceType   String?
+  referenceId     Int?
+  referenceNumber String?
+  paymentMethod   String?
+  createdAt       DateTime @default(now())
+  workspaceId     Int      @default(1)
+  createdById     Int?
+
+  workspace Workspace             @relation(fields: [workspaceId], references: [id])
+  createdBy User?                 @relation("AccountingEntryCreator", fields: [createdById], references: [id])
+  lines     AccountingEntryLine[]
+
+  @@unique([workspaceId, entryNumber])
+  @@index([workspaceId, entryDate])
+  @@index([referenceType, referenceId])
+}
+
+model AccountingEntryLine {
+  id                Int     @id @default(autoincrement())
+  debit             Float   @default(0)
+  credit            Float   @default(0)
+  note              String?
+  accountingEntryId Int
+  accountId         Int
+
+  entry   AccountingEntry   @relation(fields: [accountingEntryId], references: [id], onDelete: Cascade)
+  account AccountingAccount @relation(fields: [accountId], references: [id])
+
+  @@index([accountingEntryId])
+  @@index([accountId])
+}

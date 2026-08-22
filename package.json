@@ -1,0 +1,17 @@
+{
+  "name": "pharmacy-management-system",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "node scripts/setup.js",
+    "setup": "node scripts/setup.js",
+    "predev": "node scripts/preflight.js",
+    "dev": "concurrently \"cd backend && npm run dev\" \"cd frontend && npm run dev -- --host 0.0.0.0\"",
+    "prestart": "node scripts/preflight.js",
+    "start": "cd backend && npm start",
+    "verify": "node scripts/setup.js --skip-install --skip-seed --skip-build && npm --prefix frontend run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
