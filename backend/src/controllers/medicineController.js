@@ -1,4 +1,5 @@
 const prisma = require("../config/prisma");
+const { ensureTherapeuticClassification, getDetectedTherapeuticGroupCode } = require("../services/therapeuticClassificationService");
 const {
   parseInteger,
   parseNumber,
@@ -53,6 +54,12 @@ function sanitizeText(value) {
   if (value === undefined || value === null) return null;
   const trimmed = String(value).trim();
   return trimmed ? trimmed : null;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
 function normalizeSearchText(value) {
@@ -172,12 +179,16 @@ function buildMedicineWhere(query = {}) {
   const searchMode = String(query.searchMode || "contains").trim();
   const category = sanitizeText(query.category);
   const manufacturer = sanitizeText(query.manufacturer);
-  const clauses = [];
+  const therapeuticGroupId = parseInteger(query.therapeuticGroupId, 0);
+  const uncategorized = String(query.uncategorized || "").toLowerCase() === "true";
+  const clauses = [String(query.archived || "").toLowerCase() === "true" ? { archivedAt: { not: null } } : { archivedAt: null }];
 
   const searchCondition = buildSearchCondition(q, searchField, searchMode);
   if (searchCondition) clauses.push(searchCondition);
   if (category) clauses.push({ category });
   if (manufacturer) clauses.push({ manufacturer });
+  if (therapeuticGroupId > 0) clauses.push({ therapeuticGroupId });
+  if (uncategorized) clauses.push({ therapeuticGroupId: null });
 
   if (!clauses.length) return undefined;
   if (clauses.length === 1) return clauses[0];
@@ -204,6 +215,11 @@ function normalizeMedicinePayload(raw = {}) {
     barcode: sanitizeText(raw.barcode),
     category: sanitizeText(raw.category),
     manufacturer: sanitizeText(raw.manufacturer),
+    productTypeId: raw.productTypeId ? Number(raw.productTypeId) : null,
+    manufacturerId: raw.manufacturerId ? Number(raw.manufacturerId) : null,
+    warrantyId: raw.warrantyId ? Number(raw.warrantyId) : null,
+    therapeuticGroupId: raw.therapeuticGroupId ? Number(raw.therapeuticGroupId) : null,
+    itemVariantId: raw.itemVariantId ? Number(raw.itemVariantId) : null,
     description: sanitizeText(raw.description),
     purchasePrice: parseNumber(raw.purchasePrice),
     sellingPrice: parseNumber(raw.sellingPrice),
@@ -214,7 +230,8 @@ function normalizeMedicinePayload(raw = {}) {
     minStock: parseInteger(raw.minStock, 5),
     expiryDate: parseExcelDateValue(raw.expiryDate),
     batchNumber: sanitizeText(raw.batchNumber),
-    supplierId: raw.supplierId ? Number(raw.supplierId) : null
+    supplierId: raw.supplierId ? Number(raw.supplierId) : null,
+    isQuickSale: parseBoolean(raw.isQuickSale)
   };
 
   return {
@@ -225,7 +242,7 @@ function normalizeMedicinePayload(raw = {}) {
 }
 
 async function getMedicineOptionsData() {
-  const [categories, manufacturers] = await Promise.all([
+  const [categories, manufacturers, productTypes, manufacturerRecords, warranties, therapeuticGroups, itemVariants] = await Promise.all([
     prisma.medicine.findMany({
       where: { category: { not: null } },
       distinct: ["category"],
@@ -237,12 +254,22 @@ async function getMedicineOptionsData() {
       distinct: ["manufacturer"],
       select: { manufacturer: true },
       orderBy: { manufacturer: "asc" }
-    })
+    }),
+    prisma.productType.findMany({ where: { active: true }, select: { id: true, name: true, code: true }, orderBy: { name: "asc" } }),
+    prisma.manufacturer.findMany({ where: { active: true }, select: { id: true, name: true, code: true }, orderBy: { name: "asc" } }),
+    prisma.itemWarranty.findMany({ where: { active: true }, select: { id: true, name: true, code: true, durationMonths: true }, orderBy: { name: "asc" } }),
+    prisma.therapeuticGroup.findMany({ where: { active: true }, select: { id: true, name: true, code: true }, orderBy: { name: "asc" } }),
+    prisma.itemVariant.findMany({ where: { active: true }, select: { id: true, name: true, code: true, valuesJson: true }, orderBy: { name: "asc" } })
   ]);
 
   return {
     categories: categories.map((item) => item.category).filter(Boolean),
-    manufacturers: manufacturers.map((item) => item.manufacturer).filter(Boolean)
+    manufacturers: manufacturers.map((item) => item.manufacturer).filter(Boolean),
+    productTypes,
+    manufacturerRecords,
+    warranties,
+    therapeuticGroups,
+    itemVariants
   };
 }
 
@@ -270,6 +297,11 @@ function toMedicineCreateData(item, overrides = {}) {
     barcode: item.barcode,
     category: item.category,
     manufacturer: item.manufacturer,
+    productTypeId: item.productTypeId,
+    manufacturerId: item.manufacturerId,
+    warrantyId: item.warrantyId,
+    therapeuticGroupId: item.therapeuticGroupId,
+    itemVariantId: item.itemVariantId,
     description: item.description,
     purchasePrice: item.purchasePrice,
     sellingPrice: item.sellingPrice,
@@ -281,7 +313,8 @@ function toMedicineCreateData(item, overrides = {}) {
     minStock: item.minStock,
     expiryDate: item.expiryDate,
     batchNumber: item.batchNumber,
-    supplierId: overrides.supplierId ?? item.supplierId ?? null
+    supplierId: overrides.supplierId ?? item.supplierId ?? null,
+    isQuickSale: item.isQuickSale
   };
 }
 
@@ -478,6 +511,7 @@ function buildSpreadsheetXml(medicines) {
 
 exports.getMedicines = async (req, res) => {
   try {
+    await ensureTherapeuticClassification();
     const { medicines, meta } = await queryMedicines(req.query);
     res.json({ success: true, data: medicines, meta });
   } catch (err) {
@@ -560,7 +594,8 @@ exports.importMedicines = async (req, res) => {
             minStock: hasValue("minStock") ? item.minStock : medicine.minStock,
             expiryDate: hasValue("expiryDate") ? item.expiryDate : medicine.expiryDate,
             batchNumber: hasValue("batchNumber") ? item.batchNumber : medicine.batchNumber,
-            supplierId: hasValue("supplierId") ? item.supplierId : medicine.supplierId
+            supplierId: hasValue("supplierId") ? item.supplierId : medicine.supplierId,
+            isQuickSale: hasValue("isQuickSale") ? item.isQuickSale : medicine.isQuickSale
           };
           const updated = await tx.medicine.update({
             where: { id: medicine.id },
@@ -589,7 +624,8 @@ exports.importMedicines = async (req, res) => {
               minStock: mergedItem.minStock,
               expiryDate: mergedItem.expiryDate,
               batchNumber: mergedItem.batchNumber,
-              supplierId: mergedItem.supplierId
+              supplierId: mergedItem.supplierId,
+              isQuickSale: mergedItem.isQuickSale
             }
           });
 
@@ -705,6 +741,14 @@ exports.createMedicine = async (req, res) => {
     const data = normalizeMedicinePayload(req.body);
     if (!data.name || req.body.purchasePrice === undefined || req.body.sellingPrice === undefined) {
       return res.status(400).json({ success: false, message: "Name, purchasePrice and sellingPrice are required" });
+    }
+
+    if (!data.therapeuticGroupId) {
+      const code = getDetectedTherapeuticGroupCode(data);
+      if (code) {
+        const groups = await ensureTherapeuticClassification();
+        data.therapeuticGroupId = groups.find((group) => group.code === code)?.id || null;
+      }
     }
 
     const medicine = await prisma.$transaction(async (tx) => {
@@ -940,6 +984,11 @@ exports.updateMedicine = async (req, res) => {
           barcode: payload.barcode,
           category: payload.category,
           manufacturer: payload.manufacturer,
+          productTypeId: req.body.productTypeId !== undefined ? payload.productTypeId : undefined,
+          manufacturerId: req.body.manufacturerId !== undefined ? payload.manufacturerId : undefined,
+          warrantyId: req.body.warrantyId !== undefined ? payload.warrantyId : undefined,
+          therapeuticGroupId: req.body.therapeuticGroupId !== undefined ? payload.therapeuticGroupId : undefined,
+          itemVariantId: req.body.itemVariantId !== undefined ? payload.itemVariantId : undefined,
           description: payload.description,
           purchasePrice: req.body.purchasePrice !== undefined ? payload.purchasePrice : undefined,
           sellingPrice: req.body.sellingPrice !== undefined ? payload.sellingPrice : undefined,
@@ -951,7 +1000,8 @@ exports.updateMedicine = async (req, res) => {
           minStock: req.body.minStock !== undefined ? payload.minStock : undefined,
           expiryDate: req.body.expiryDate !== undefined ? payload.expiryDate : undefined,
           batchNumber: payload.batchNumber,
-          supplierId: req.body.supplierId !== undefined ? payload.supplierId : undefined
+          supplierId: req.body.supplierId !== undefined ? payload.supplierId : undefined,
+          isQuickSale: req.body.isQuickSale !== undefined ? payload.isQuickSale : undefined
         }
       });
 
@@ -1028,6 +1078,36 @@ exports.deleteMedicine = async (req, res) => {
       return res.status(404).json({ success: false, message: "Medicine not found" });
     }
     res.status(500).json({ success: false, message: err.message || "Server Error" });
+  }
+};
+
+exports.archiveMedicine = async (req, res) => {
+  try {
+    const medicine = await prisma.medicine.update({ where: { id: Number(req.params.id) }, data: { archivedAt: new Date() } });
+    res.json({ success: true, data: medicine, message: "Medicine archived" });
+  } catch (error) { res.status(error.code === "P2025" ? 404 : 500).json({ success: false, message: "Could not archive medicine" }); }
+};
+
+exports.restoreMedicine = async (req, res) => {
+  try {
+    const medicine = await prisma.medicine.update({ where: { id: Number(req.params.id) }, data: { archivedAt: null } });
+    res.json({ success: true, data: medicine, message: "Medicine restored" });
+  } catch (error) { res.status(error.code === "P2025" ? 404 : 500).json({ success: false, message: "Could not restore medicine" }); }
+};
+
+exports.updateQuickSaleStatus = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ success: false, message: "Medicine id is required" });
+    const medicine = await prisma.medicine.update({
+      where: { id },
+      data: { isQuickSale: parseBoolean(req.body.isQuickSale) },
+      include: { supplier: true, medicineBoxes: true }
+    });
+    res.json({ success: true, message: "Quick sale status updated", data: withPackagingSummary(medicine) });
+  } catch (err) {
+    if (err.code === "P2025") return res.status(404).json({ success: false, message: "Medicine not found" });
+    res.status(500).json({ success: false, message: "Server Error" });
   }
 };
 

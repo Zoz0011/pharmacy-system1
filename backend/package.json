@@ -2,7 +2,7 @@
   "name": "pharmacore-backend",
   "version": "1.0.0",
   "description": "PharmaCore Pharmacy Management System Backend v1",
-  "main": "src/server.js",
+  "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "dev": "nodemon src/server.js",
@@ -10,7 +10,10 @@
     "prisma": "prisma",
     "setup": "node ../scripts/ensure-env.js && prisma generate && prisma db push --skip-generate && node prisma/seed.js",
     "migrate": "prisma migrate dev",
-    "seed": "node prisma/seed.js"
+    "seed": "node prisma/seed.js",
+    "snapshot:turso": "node scripts/prepare-turso-import.js",
+    "migrate:firestore": "node scripts/migrate-sqlite-to-firestore.js",
+    "test": "node test/architecture.test.js"
   },
   "keywords": [
     "pharmacy",
@@ -22,11 +25,14 @@
   "author": "Ziad Reda",
   "license": "ISC",
   "dependencies": {
+    "@prisma/adapter-libsql": "^6.19.3",
     "@prisma/client": "^6.19.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "firebase-admin": "^14.3.0",
+    "firebase-functions": "^7.3.2",
     "jsonwebtoken": "^9.0.3",
     "nodemailer": "^9.0.5"
   },
@@ -38,5 +44,8 @@
     "@prisma/client@6.19.3": true,
     "@prisma/engines@6.19.3": true,
     "prisma@6.19.3": true
+  },
+  "engines": {
+    "node": "20"
   }
 }

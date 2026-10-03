@@ -2,6 +2,7 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const prisma = require("../config/prisma");
+const { getUserPermissions } = require("../config/permissions");
 const { sendPasswordResetCode } = require("../services/emailService");
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -16,6 +17,7 @@ function sanitizeUser(user) {
     username: user.username,
     email: user.email,
     role: user.role,
+    permissions: getUserPermissions(user),
     workspaceId: user.workspaceId,
     workspaceName: user.workspace?.name,
     createdAt: user.createdAt,
@@ -33,6 +35,8 @@ function signToken(user) {
 
 exports.register = async (req, res) => {
   try {
+    // Public registration creates a completely separate pharmacy workspace.
+    // Employees in an existing workspace are still created by its administrator.
     const { username, email, password, confirmPassword } = req.body;
 
     if (!username || !email || !password || !confirmPassword) {

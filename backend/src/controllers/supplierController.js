@@ -237,6 +237,82 @@ exports.deleteSupplier = async (req, res) => {
   }
 };
 
+exports.getSupplierProfile = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const supplier = await prisma.supplier.findUnique({
+      where: { id },
+      include: {
+        linkedCustomer: {
+          include: {
+            sales: {
+              include: { items: { include: { medicine: { select: { id: true, name: true, quantity: true } } } } },
+              orderBy: { createdAt: "desc" }
+            },
+            accountTransactions: {
+              include: { user: { select: { id: true, name: true, role: true } }, sale: { select: { id: true, invoiceNumber: true, finalAmount: true, status: true } } },
+              orderBy: { createdAt: "desc" },
+              take: 200
+            }
+          }
+        },
+        medicines: { select: { id: true, name: true, quantity: true, minStock: true, updatedAt: true } },
+        purchaseInvoices: {
+          include: { items: { include: { medicine: { select: { id: true, name: true, quantity: true } } } } },
+          orderBy: { createdAt: "desc" }
+        }
+      }
+    });
+    if (!supplier) return res.status(404).json({ success: false, message: "Supplier not found" });
+
+    const referenceFilters = [{ referenceType: "SUPPLIER", referenceId: supplier.id }];
+    if (supplier.linkedCustomer) referenceFilters.push({ referenceType: "CUSTOMER", referenceId: supplier.linkedCustomer.id });
+    const payments = await prisma.treasuryTransaction.findMany({
+      where: { OR: referenceFilters },
+      include: { treasuryAccount: { select: { id: true, name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 200
+    });
+    const supplierPayments = payments.filter((row) => row.type === "SUPPLIER_PAYMENT").reduce((sum, row) => sum + Number(row.amount || 0), 0);
+    const completedPurchases = supplier.purchaseInvoices.filter((row) => row.status !== "RETURNED");
+    const unpaidPurchases = completedPurchases.filter((row) => row.paymentStatus !== "PAID").reduce((sum, row) => sum + Number(row.totalAmount || 0), 0);
+    const supplierDue = toMoney(Math.max(0, Number(supplier.openingBalance || 0) + unpaidPurchases - supplierPayments));
+    const customer = supplier.linkedCustomer;
+    const sales = customer?.sales || [];
+    const inventory = supplier.purchaseInvoices.flatMap((invoice) => invoice.items.map((item) => ({
+      id: `PURCHASE-${invoice.id}-${item.id}`,
+      type: invoice.status === "RETURNED" ? "PURCHASE_RETURN" : "PURCHASE",
+      medicineId: item.medicineId,
+      medicineName: item.medicine?.name,
+      quantityChange: invoice.status === "RETURNED" ? -Number(item.quantity || 0) : Number(item.quantity || 0),
+      quantityAfter: item.medicine?.quantity,
+      referenceNumber: invoice.invoiceNumber,
+      createdAt: invoice.returnedAt || invoice.createdAt
+    })));
+    const activities = [
+      ...supplier.purchaseInvoices.map((row) => ({ id: `PURCHASE-${row.id}`, kind: "PURCHASE", title: row.status === "RETURNED" ? "مرتجع مشتريات" : "فاتورة مشتريات", reference: row.invoiceNumber, amount: row.totalAmount, createdAt: row.returnedAt || row.createdAt })),
+      ...sales.map((row) => ({ id: `SALE-${row.id}`, kind: "SALE", title: row.status === "RETURNED" ? "مرتجع مبيعات" : "فاتورة مبيعات", reference: row.invoiceNumber, amount: row.refundedAmount || row.finalAmount, createdAt: row.returnedAt || row.createdAt })),
+      ...(customer?.accountTransactions || []).map((row) => ({ id: `ACCOUNT-${row.id}`, kind: "ACCOUNT", title: row.type, reference: row.sale?.invoiceNumber || null, amount: row.amount, createdAt: row.createdAt })),
+      ...payments.map((row) => ({ id: `TREASURY-${row.id}`, kind: "TREASURY", title: row.type, reference: row.referenceNumber, amount: row.amount, direction: row.direction, createdAt: row.createdAt }))
+    ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.json({ success: true, data: {
+      role: customer ? "BOTH" : "SUPPLIER",
+      supplier: { ...supplier, customFields: parseCustomFields(supplier.customFields) },
+      customer,
+      sales,
+      purchases: supplier.purchaseInvoices,
+      inventory,
+      accountTransactions: customer?.accountTransactions || [],
+      payments,
+      activities,
+      stats: { supplierDue, customerDue: toMoney(customer?.accountBalance || 0), totalSales: toMoney(sales.filter((row) => row.status !== "RETURNED").reduce((sum, row) => sum + Number(row.finalAmount || 0), 0)), totalPurchases: toMoney(completedPurchases.reduce((sum, row) => sum + Number(row.totalAmount || 0), 0)) }
+    } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to load supplier profile", error: error.message });
+  }
+};
+
 exports.recordPayment = async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -257,8 +333,10 @@ exports.recordPayment = async (req, res) => {
         where: { userId: req.user.id, status: "OPEN" },
         orderBy: { openedAt: "desc" }
       });
-      if (!openShift) throw Object.assign(new Error("Open a cashier shift before paying a supplier"), { code: "SHIFT_REQUIRED" });
-      const expense = await tx.shiftExpense.create({
+      if (req.user.role === "CASHIER" && !openShift) {
+        throw Object.assign(new Error("Open a cashier shift before recording a supplier payment"), { code: "SHIFT_REQUIRED" });
+      }
+      const expense = openShift ? await tx.shiftExpense.create({
         data: {
           cashierShiftId: openShift.id,
           userId: req.user.id,
@@ -267,25 +345,27 @@ exports.recordPayment = async (req, res) => {
           paymentMethod,
           note: note || `سداد للمورد ${supplier.name}`
         }
-      });
+      }) : null;
       const treasury = await recordTreasuryTransaction(tx, {
         type: "SUPPLIER_PAYMENT",
         direction: "OUT",
         amount,
+        accountingAccountId: req.body.accountingAccountId,
+        treasuryAccountId: req.body.treasuryAccountId,
         paymentMethod,
         note: note || `سداد للمورد ${supplier.name}`,
         referenceType: "SUPPLIER",
         referenceId: supplier.id,
         referenceNumber: supplier.name,
         userId: req.user.id,
-        cashierShiftId: openShift.id
+        cashierShiftId: openShift?.id || null
       });
       return { supplier, expense, treasury };
     });
     res.status(201).json({ success: true, message: "Supplier payment recorded", data });
   } catch (error) {
     if (error.code === "NOT_FOUND") return res.status(404).json({ success: false, message: error.message });
-    if (error.code === "SHIFT_REQUIRED") return res.status(400).json({ success: false, message: error.message });
+    if (error.code === "SHIFT_REQUIRED") return res.status(400).json({ success: false, message: "افتح وردية كاشير قبل تسجيل سداد المورد." });
     res.status(500).json({ success: false, message: "Failed to record supplier payment", error: error.message });
   }
 };

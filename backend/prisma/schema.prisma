@@ -26,10 +26,27 @@ model Workspace {
   stockMovements       StockMovement[]
   purchaseInvoices     PurchaseInvoice[]
   shiftExpenses        ShiftExpense[]
+  expenseCategories    ExpenseCategory[]
   treasuryAccounts     TreasuryAccount[]
   treasuryTransactions TreasuryTransaction[]
   accountingAccounts   AccountingAccount[]
   accountingEntries    AccountingEntry[]
+  prescriptions       Prescription[]
+  branches            Branch[]
+  inventoryTransfers  InventoryTransfer[]
+  productTypes        ProductType[]
+  manufacturers       Manufacturer[]
+  priceGroups         PriceGroup[]
+  warranties          ItemWarranty[]
+  itemExchanges       ItemExchange[]
+  promotions          Promotion[]
+  deliveryAgents      DeliveryAgent[]
+  salesAgents         SalesAgent[]
+  customerGroups      CustomerGroup[]
+  therapeuticGroups   TherapeuticGroup[]
+  itemVariants        ItemVariant[]
+  auditLogs           AuditLog[]
+  notifications       Notification[]
 }
 
 model User {
@@ -41,6 +58,7 @@ model User {
   passwordResetCodeHash  String?
   passwordResetExpiresAt DateTime?
   role                   String    @default("PHARMACIST")
+  permissions            String    @default("[]")
   phone                  String?
   alternatePhone         String?
   telephone              String?
@@ -71,6 +89,11 @@ model User {
   shiftExpenses               ShiftExpense[]
   accountingAccounts          AccountingAccount[]          @relation("AccountingAccountCreator")
   accountingEntries           AccountingEntry[]            @relation("AccountingEntryCreator")
+  prescriptions               Prescription[]
+  inventoryTransfers         InventoryTransfer[] @relation("InventoryTransferCreator")
+  itemExchanges              ItemExchange[]
+  auditLogs                   AuditLog[]     @relation("AuditActor")
+  notifications               Notification[] @relation("NotificationRecipient")
 }
 
 model Supplier {
@@ -110,7 +133,7 @@ model Supplier {
 
   medicines        Medicine[]
   purchaseInvoices PurchaseInvoice[]
-  sales             Sale[]
+  sales            Sale[]
 
   @@index([workspaceId, contactCode])
 }
@@ -153,6 +176,7 @@ model Customer {
 
   sales               Sale[]
   accountTransactions CustomerAccountTransaction[]
+  prescriptions       Prescription[]
 
   @@index([workspaceId, contactCode])
 }
@@ -172,6 +196,11 @@ model Medicine {
   barcode           String?
   category          String?
   manufacturer      String?
+  productTypeId     Int?
+  manufacturerId    Int?
+  warrantyId        Int?
+  therapeuticGroupId Int?
+  itemVariantId     Int?
   description       String?
   purchasePrice     Float
   sellingPrice      Float
@@ -184,6 +213,8 @@ model Medicine {
   expiryDate        DateTime?
   batchNumber       String?
   supplierId        Int?
+  isQuickSale       Boolean   @default(false)
+  archivedAt        DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   workspaceId       Int       @default(1)
@@ -195,24 +226,33 @@ model Medicine {
   purchaseInvoiceItems PurchaseInvoiceItem[]
   medicineBoxes        MedicineBox[]
   inventoryCountItems  InventoryCountItem[]
+  prescriptionItems    PrescriptionItem[]
+  inventoryTransferItems InventoryTransferItem[]
+  exchangedFrom         ItemExchange[] @relation("ExchangeFromMedicine")
+  exchangedTo           ItemExchange[] @relation("ExchangeToMedicine")
+  productType           ProductType? @relation(fields: [productTypeId], references: [id])
+  manufacturerRecord    Manufacturer? @relation("ManufacturerRecord", fields: [manufacturerId], references: [id])
+  warranty              ItemWarranty? @relation(fields: [warrantyId], references: [id])
+  therapeuticGroup      TherapeuticGroup? @relation(fields: [therapeuticGroupId], references: [id])
+  itemVariant           ItemVariant? @relation(fields: [itemVariantId], references: [id])
 
   @@unique([workspaceId, barcode])
 }
 
 model Sale {
-  id             Int       @id @default(autoincrement())
-  invoiceNumber  String    @unique
-  totalAmount    Float
-  discount       Float     @default(0)
-  finalAmount    Float
-  refundedAmount Float     @default(0)
-  status         String    @default("COMPLETED")
-  paymentMethod  String    @default("CASH")
-  counterpartyType String  @default("CASH")
-  createdAt      DateTime  @default(now())
-  returnedAt     DateTime?
-  workspaceId    Int       @default(1)
-  workspace      Workspace @relation(fields: [workspaceId], references: [id])
+  id               Int       @id @default(autoincrement())
+  invoiceNumber    String    @unique
+  totalAmount      Float
+  discount         Float     @default(0)
+  finalAmount      Float
+  refundedAmount   Float     @default(0)
+  status           String    @default("COMPLETED")
+  paymentMethod    String    @default("CASH")
+  counterpartyType String    @default("CASH")
+  createdAt        DateTime  @default(now())
+  returnedAt       DateTime?
+  workspaceId      Int       @default(1)
+  workspace        Workspace @relation(fields: [workspaceId], references: [id])
 
   userId         Int
   customerId     Int?
@@ -224,9 +264,22 @@ model Sale {
   supplier            Supplier?                    @relation(fields: [supplierId], references: [id])
   cashierShift        CashierShift?                @relation(fields: [cashierShiftId], references: [id])
   items               SaleItem[]
+  payments            SalePayment[]
   accountTransactions CustomerAccountTransaction[]
 
   @@index([workspaceId, createdAt])
+}
+
+model SalePayment {
+  id            Int      @id @default(autoincrement())
+  paymentMethod String
+  amount        Float
+  createdAt     DateTime @default(now())
+
+  saleId Int
+  sale   Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@index([saleId])
 }
 
 model CashierShift {
@@ -270,6 +323,21 @@ model ShiftExpense {
   @@index([workspaceId, createdAt])
 }
 
+model ExpenseCategory {
+  id          Int       @id @default(autoincrement())
+  name        String
+  code        String?
+  cycle       String    @default("GENERAL")
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, active])
+}
+
 model CustomerAccountTransaction {
   id           Int      @id @default(autoincrement())
   type         String
@@ -296,6 +364,9 @@ model InventoryCount {
   countNumber String    @unique
   status      String    @default("OPEN")
   notes       String?
+  plannedStart DateTime?
+  plannedEnd   DateTime?
+  branchName   String?
   createdAt   DateTime  @default(now())
   completedAt DateTime?
   workspaceId Int       @default(1)
@@ -434,16 +505,18 @@ model BoxSaleAllocation {
 }
 
 model TreasuryAccount {
-  id          Int      @id @default(autoincrement())
-  name        String
-  balance     Float    @default(0)
-  isDefault   Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  workspaceId Int      @default(1)
+  id                  Int      @id @default(autoincrement())
+  name                String
+  balance             Float    @default(0)
+  isDefault           Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  workspaceId         Int      @default(1)
+  accountingAccountId Int?     @unique
 
-  workspace    Workspace             @relation(fields: [workspaceId], references: [id])
-  transactions TreasuryTransaction[]
+  workspace         Workspace             @relation(fields: [workspaceId], references: [id])
+  accountingAccount AccountingAccount?    @relation(fields: [accountingAccountId], references: [id], onDelete: SetNull)
+  transactions      TreasuryTransaction[]
 
   @@unique([workspaceId, name])
   @@index([workspaceId, isDefault])
@@ -476,26 +549,28 @@ model TreasuryTransaction {
 }
 
 model AccountingAccount {
-  id             Int      @id @default(autoincrement())
-  name           String
-  accountNumber  String
-  accountType    String
-  subType        String?
-  nature         String
-  openingBalance Float    @default(0)
-  balance        Float    @default(0)
-  note           String?
-  details        String?
-  systemKey      String?
-  active         Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  workspaceId    Int      @default(1)
-  createdById    Int?
+  id               Int      @id @default(autoincrement())
+  name             String
+  accountNumber    String
+  accountType      String
+  subType          String?
+  nature           String
+  openingBalance   Float    @default(0)
+  balance          Float    @default(0)
+  note             String?
+  details          String?
+  systemKey        String?
+  active           Boolean  @default(true)
+  isPaymentAccount Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  workspaceId      Int      @default(1)
+  createdById      Int?
 
-  workspace Workspace             @relation(fields: [workspaceId], references: [id])
-  createdBy User?                 @relation("AccountingAccountCreator", fields: [createdById], references: [id])
-  lines     AccountingEntryLine[]
+  workspace       Workspace             @relation(fields: [workspaceId], references: [id])
+  createdBy       User?                 @relation("AccountingAccountCreator", fields: [createdById], references: [id])
+  lines           AccountingEntryLine[]
+  treasuryAccount TreasuryAccount?
 
   @@unique([workspaceId, accountNumber])
   @@unique([workspaceId, systemKey])
@@ -538,4 +613,321 @@ model AccountingEntryLine {
 
   @@index([accountingEntryId])
   @@index([accountId])
+}
+
+model Prescription {
+  id             Int                @id @default(autoincrement())
+  prescriptionNo String             @unique
+  patientName    String
+  patientPhone   String?
+  doctorName     String?
+  diagnosis      String?
+  notes          String?
+  status         String             @default("ACTIVE")
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  workspaceId    Int                @default(1)
+  customerId     Int?
+  createdById    Int
+
+  workspace      Workspace          @relation(fields: [workspaceId], references: [id])
+  customer       Customer?          @relation(fields: [customerId], references: [id])
+  createdBy      User               @relation(fields: [createdById], references: [id])
+  items          PrescriptionItem[]
+
+  @@index([workspaceId, createdAt])
+  @@index([customerId, status])
+}
+
+model PrescriptionItem {
+  id             Int          @id @default(autoincrement())
+  dosage         String?
+  frequency      String?
+  duration       String?
+  quantity       Int          @default(1)
+  instructions   String?
+  prescriptionId Int
+  medicineId     Int
+
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  medicine       Medicine     @relation(fields: [medicineId], references: [id])
+
+  @@index([prescriptionId])
+  @@index([medicineId])
+}
+
+model Branch {
+  id          Int      @id @default(autoincrement())
+  name        String
+  code        String
+  phone       String?
+  email       String?
+  address     String?
+  isActive    Boolean  @default(true)
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  workspaceId Int      @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  outgoingTransfers InventoryTransfer[] @relation("InventoryTransferSource")
+  incomingTransfers InventoryTransfer[] @relation("InventoryTransferDestination")
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, isActive])
+}
+
+model InventoryTransfer {
+  id                Int       @id @default(autoincrement())
+  transferNumber    String    @unique
+  status            String    @default("PENDING")
+  notes             String?
+  createdAt         DateTime  @default(now())
+  receivedAt        DateTime?
+  workspaceId       Int       @default(1)
+  workspace         Workspace @relation(fields: [workspaceId], references: [id])
+  sourceBranchId    Int
+  destinationBranchId Int
+  createdById       Int
+
+  sourceBranch      Branch    @relation("InventoryTransferSource", fields: [sourceBranchId], references: [id])
+  destinationBranch Branch    @relation("InventoryTransferDestination", fields: [destinationBranchId], references: [id])
+  createdBy         User      @relation("InventoryTransferCreator", fields: [createdById], references: [id])
+  items             InventoryTransferItem[]
+
+  @@index([workspaceId, createdAt])
+  @@index([sourceBranchId, status])
+  @@index([destinationBranchId, status])
+}
+
+model InventoryTransferItem {
+  id          Int               @id @default(autoincrement())
+  transferId  Int
+  medicineId  Int
+  quantity    Int
+
+  transfer    InventoryTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  medicine    Medicine           @relation(fields: [medicineId], references: [id])
+
+  @@unique([transferId, medicineId])
+  @@index([medicineId])
+}
+
+model ProductType {
+  id          Int       @id @default(autoincrement())
+  code        String
+  name        String
+  description String?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  medicines   Medicine[]
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, active])
+}
+
+model Manufacturer {
+  id          Int       @id @default(autoincrement())
+  code        String
+  name        String
+  phone       String?
+  email       String?
+  description String?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  medicines   Medicine[] @relation("ManufacturerRecord")
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, active])
+}
+
+model PriceGroup {
+  id             Int       @id @default(autoincrement())
+  name           String
+  markupPercent  Float     @default(0)
+  discountPercent Float    @default(0)
+  isDefault      Boolean   @default(false)
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  workspaceId    Int       @default(1)
+  workspace      Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, active])
+}
+
+model ItemWarranty {
+  id             Int       @id @default(autoincrement())
+  code           String
+  name           String
+  description    String?
+  durationMonths Int       @default(0)
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  workspaceId    Int       @default(1)
+  workspace      Workspace @relation(fields: [workspaceId], references: [id])
+  medicines      Medicine[]
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, active])
+}
+
+model ItemExchange {
+  id               Int       @id @default(autoincrement())
+  exchangeNumber   String    @unique
+  quantityFrom     Int
+  quantityTo       Int
+  reason           String?
+  createdAt        DateTime  @default(now())
+  workspaceId      Int       @default(1)
+  workspace        Workspace @relation(fields: [workspaceId], references: [id])
+  fromMedicineId   Int
+  toMedicineId     Int
+  createdById      Int
+  fromMedicine     Medicine  @relation("ExchangeFromMedicine", fields: [fromMedicineId], references: [id])
+  toMedicine       Medicine  @relation("ExchangeToMedicine", fields: [toMedicineId], references: [id])
+  createdBy        User      @relation(fields: [createdById], references: [id])
+
+  @@index([workspaceId, createdAt])
+}
+
+model Promotion {
+  id            Int       @id @default(autoincrement())
+  name          String
+  discountType  String    @default("PERCENT")
+  discountValue Float     @default(0)
+  startDate     DateTime?
+  endDate       DateTime?
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  workspaceId   Int       @default(1)
+  workspace     Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, active])
+}
+
+model DeliveryAgent {
+  id                 Int       @id @default(autoincrement())
+  name               String
+  phone              String
+  email              String?
+  deliveryArea       String?
+  active             Boolean   @default(true)
+  deliveryOperations Int       @default(0)
+  collectedAmount    Float     @default(0)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  workspaceId        Int       @default(1)
+  workspace          Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@index([workspaceId, active])
+  @@index([workspaceId, name])
+}
+
+model SalesAgent {
+  id          Int       @id @default(autoincrement())
+  name        String
+  phone       String?
+  email       String?
+  address     String?
+  commission  Float     @default(0)
+  active      Boolean   @default(true)
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@index([workspaceId, active])
+  @@index([workspaceId, name])
+}
+
+model CustomerGroup {
+  id          Int       @id @default(autoincrement())
+  name        String
+  rate        Float     @default(0)
+  priceGroup  String?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, active])
+}
+
+model TherapeuticGroup {
+  id          Int       @id @default(autoincrement())
+  code        String
+  name        String
+  description String?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  medicines   Medicine[]
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, active])
+}
+
+model ItemVariant {
+  id          Int       @id @default(autoincrement())
+  code        String
+  name        String
+  valuesJson  String    @default("[]")
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspaceId Int       @default(1)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  medicines   Medicine[]
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, active])
+}
+
+model AuditLog {
+  id          Int      @id @default(autoincrement())
+  action      String
+  entityType  String
+  entityId    String?
+  description String
+  metadata    String?
+  createdAt   DateTime @default(now())
+  workspaceId Int      @default(1)
+  actorUserId Int?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  actor       User?    @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id          Int       @id @default(autoincrement())
+  title       String
+  message     String
+  type        String    @default("INFO")
+  isRead      Boolean   @default(false)
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+  workspaceId Int       @default(1)
+  userId      Int?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  user        User?     @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, userId, isRead])
+  @@index([workspaceId, createdAt])
 }

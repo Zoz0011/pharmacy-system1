@@ -11,7 +11,7 @@ const customerMoney = (value) => Number(Number(value || 0).toFixed(2));
 function normalizeCustomerPayload(body = {}) {
   const data = {};
   for (const field of customerTextFields) if (body[field] !== undefined) data[field] = String(body[field] || "").trim() || null;
-  data.customerType = String(body.customerType || "PERSON").toUpperCase() === "BUSINESS" ? "BUSINESS" : "PERSON";
+  if (body.customerType !== undefined) data.customerType = String(body.customerType || "PERSON").toUpperCase() === "BUSINESS" ? "BUSINESS" : "PERSON";
   if (body.openingBalance !== undefined) data.openingBalance = customerMoney(body.openingBalance);
   if (body.creditLimit !== undefined) data.creditLimit = customerMoney(body.creditLimit);
   if (body.paymentTermValue !== undefined) {
@@ -19,7 +19,10 @@ function normalizeCustomerPayload(body = {}) {
     data.paymentTermValue = Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
   }
   if (body.customFields !== undefined) data.customFields = JSON.stringify(body.customFields && typeof body.customFields === "object" ? body.customFields : {});
-  data.address = [data.addressLine1, data.addressLine2, data.district, data.city, data.state, data.country, data.postalCode].filter(Boolean).join("، ") || (body.address ? String(body.address).trim() : null);
+  const suppliedAddressFields = ["address", "addressLine1", "addressLine2", "district", "city", "state", "country", "postalCode"];
+  if (suppliedAddressFields.some((field) => body[field] !== undefined)) {
+    data.address = [data.addressLine1, data.addressLine2, data.district, data.city, data.state, data.country, data.postalCode].filter(Boolean).join("، ") || (body.address ? String(body.address).trim() : null);
+  }
   return data;
 }
 
@@ -220,6 +223,86 @@ exports.updateCustomer = async (req, res) => {
   }
 };
 
+exports.getCustomerProfile = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const customer = await prisma.customer.findUnique({
+      where: { id },
+      include: {
+        supplierProfile: {
+          include: {
+            medicines: { select: { id: true, name: true, quantity: true, minStock: true, updatedAt: true } },
+            purchaseInvoices: {
+              include: { items: { include: { medicine: { select: { id: true, name: true, quantity: true } } } } },
+              orderBy: { createdAt: "desc" }
+            }
+          }
+        },
+        sales: {
+          include: { items: { include: { medicine: { select: { id: true, name: true, quantity: true } } } } },
+          orderBy: { createdAt: "desc" }
+        },
+        accountTransactions: {
+          include: {
+            user: { select: { id: true, name: true, role: true } },
+            sale: { select: { id: true, invoiceNumber: true, finalAmount: true, status: true } }
+          },
+          orderBy: { createdAt: "desc" },
+          take: 200
+        }
+      }
+    });
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
+
+    const referenceFilters = [{ referenceType: "CUSTOMER", referenceId: customer.id }];
+    if (customer.supplierProfile) referenceFilters.push({ referenceType: "SUPPLIER", referenceId: customer.supplierProfile.id });
+    const payments = await prisma.treasuryTransaction.findMany({
+      where: { OR: referenceFilters },
+      include: { treasuryAccount: { select: { id: true, name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 200
+    });
+
+    const parsed = parseCustomer(customer);
+    const supplier = customer.supplierProfile;
+    const purchases = supplier?.purchaseInvoices || [];
+    const supplierPayments = payments.filter((row) => row.type === "SUPPLIER_PAYMENT").reduce((sum, row) => sum + Number(row.amount || 0), 0);
+    const unpaidPurchases = purchases.filter((row) => row.status !== "RETURNED" && row.paymentStatus !== "PAID").reduce((sum, row) => sum + Number(row.totalAmount || 0), 0);
+    const supplierDue = customerMoney(Math.max(0, Number(supplier?.openingBalance || 0) + unpaidPurchases - supplierPayments));
+    const inventory = purchases.flatMap((invoice) => invoice.items.map((item) => ({
+      id: `PURCHASE-${invoice.id}-${item.id}`,
+      type: invoice.status === "RETURNED" ? "PURCHASE_RETURN" : "PURCHASE",
+      medicineId: item.medicineId,
+      medicineName: item.medicine?.name,
+      quantityChange: invoice.status === "RETURNED" ? -Number(item.quantity || 0) : Number(item.quantity || 0),
+      quantityAfter: item.medicine?.quantity,
+      referenceNumber: invoice.invoiceNumber,
+      createdAt: invoice.returnedAt || invoice.createdAt
+    })));
+    const activities = [
+      ...customer.sales.map((row) => ({ id: `SALE-${row.id}`, kind: "SALE", title: row.status === "RETURNED" ? "مرتجع مبيعات" : "فاتورة مبيعات", reference: row.invoiceNumber, amount: row.refundedAmount || row.finalAmount, createdAt: row.returnedAt || row.createdAt })),
+      ...purchases.map((row) => ({ id: `PURCHASE-${row.id}`, kind: "PURCHASE", title: row.status === "RETURNED" ? "مرتجع مشتريات" : "فاتورة مشتريات", reference: row.invoiceNumber, amount: row.totalAmount, createdAt: row.returnedAt || row.createdAt })),
+      ...customer.accountTransactions.map((row) => ({ id: `ACCOUNT-${row.id}`, kind: "ACCOUNT", title: row.type, reference: row.sale?.invoiceNumber || null, amount: row.amount, createdAt: row.createdAt })),
+      ...payments.map((row) => ({ id: `TREASURY-${row.id}`, kind: "TREASURY", title: row.type, reference: row.referenceNumber, amount: row.amount, direction: row.direction, createdAt: row.createdAt }))
+    ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.json({ success: true, data: {
+      role: supplier ? "BOTH" : "CUSTOMER",
+      customer: parsed,
+      supplier,
+      sales: customer.sales,
+      purchases,
+      inventory,
+      accountTransactions: customer.accountTransactions,
+      payments,
+      activities,
+      stats: { customerDue: parsed.stats.totalDue, supplierDue, totalSales: parsed.stats.totalSales, totalPurchases: customerMoney(purchases.filter((row) => row.status !== "RETURNED").reduce((sum, row) => sum + Number(row.totalAmount || 0), 0)) }
+    } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to load customer profile", error: error.message });
+  }
+};
+
 exports.getCustomerAccount = async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -255,16 +338,19 @@ exports.recordPayment = async (req, res) => {
     const result = await prisma.$transaction(async (tx) => {
       const customer = await tx.customer.findUnique({ where: { id }, include: { supplierProfile: true } });
       if (!customer) throw Object.assign(new Error("Customer not found"), { code: "NOT_FOUND" });
+      const openShift = await tx.cashierShift.findFirst({
+        where: { userId: req.user.id, status: "OPEN" },
+        orderBy: { openedAt: "desc" }
+      });
+      if (req.user.role === "CASHIER" && !openShift) {
+        throw Object.assign(new Error("Open a cashier shift before collecting a customer payment"), { code: "SHIFT_REQUIRED" });
+      }
       if (amount > Number(customer.accountBalance || 0)) {
         throw Object.assign(new Error("Payment cannot exceed the current customer debt"), { code: "OVERPAYMENT" });
       }
 
       const balanceAfter = Number((customer.accountBalance - amount).toFixed(2));
       const updated = await tx.customer.update({ where: { id }, data: { accountBalance: balanceAfter } });
-      const openShift = await tx.cashierShift.findFirst({
-        where: { userId: req.user.id, status: "OPEN" },
-        orderBy: { openedAt: "desc" }
-      });
       const transaction = await tx.customerAccountTransaction.create({
         data: {
           customerId: id,
@@ -280,6 +366,8 @@ exports.recordPayment = async (req, res) => {
         type: "CUSTOMER_PAYMENT",
         direction: "IN",
         amount,
+        accountingAccountId: req.body.accountingAccountId,
+        treasuryAccountId: req.body.treasuryAccountId,
         paymentMethod: String(req.body.paymentMethod || "CASH"),
         note: note || `تحصيل من العميل ${customer.name}`,
         referenceType: "CUSTOMER",
@@ -295,7 +383,64 @@ exports.recordPayment = async (req, res) => {
   } catch (error) {
     if (error.code === "NOT_FOUND") return res.status(404).json({ success: false, message: error.message });
     if (error.code === "OVERPAYMENT") return res.status(400).json({ success: false, message: error.message });
+    if (error.code === "SHIFT_REQUIRED") return res.status(400).json({ success: false, message: "افتح وردية كاشير قبل تحصيل دفعة من العميل." });
     res.status(500).json({ success: false, message: "Failed to record customer payment" });
+  }
+};
+
+exports.recordAdvance = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const amount = customerMoney(req.body.amount);
+    const paymentMethod = String(req.body.paymentMethod || "CASH").trim().toUpperCase();
+    const note = String(req.body.note || "").trim() || null;
+    if (!id || !Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: "A positive advance amount is required" });
+    if (!["CASH", "CARD", "TRANSFER"].includes(paymentMethod)) return res.status(400).json({ success: false, message: "Unsupported payment method" });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const customer = await tx.customer.findUnique({ where: { id } });
+      if (!customer) throw Object.assign(new Error("Customer not found"), { code: "NOT_FOUND" });
+      const balanceAfter = customerMoney(Number(customer.accountBalance || 0) - amount);
+      const updated = await tx.customer.update({ where: { id }, data: { accountBalance: balanceAfter } });
+      const openShift = await tx.cashierShift.findFirst({ where: { userId: req.user.id, status: "OPEN" }, orderBy: { openedAt: "desc" } });
+      const transaction = await tx.customerAccountTransaction.create({ data: { customerId: id, userId: req.user.id, type: "ADVANCE", amount: -amount, balanceAfter, cashierShiftId: openShift?.id || null, note: note || "Customer advance" } });
+      const expense = openShift ? await tx.shiftExpense.create({ data: { cashierShiftId: openShift.id, userId: req.user.id, amount, category: "CUSTOMER_ADVANCE", paymentMethod, note: note || `سلفة للعميل ${customer.name}` } }) : null;
+      const treasury = await recordTreasuryTransaction(tx, { type: "CUSTOMER_ADVANCE", direction: "OUT", amount, accountingAccountId: req.body.accountingAccountId, treasuryAccountId: req.body.treasuryAccountId, paymentMethod, note: note || `سلفة للعميل ${customer.name}`, referenceType: "CUSTOMER", referenceId: customer.id, referenceNumber: customer.name, userId: req.user.id, cashierShiftId: openShift?.id || null });
+      return { customer: updated, transaction, expense, treasury };
+    });
+    res.status(201).json({ success: true, message: "Customer advance recorded", data: result });
+  } catch (error) {
+    if (error.code === "NOT_FOUND") return res.status(404).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: "Failed to record customer advance", error: error.message });
+  }
+};
+
+exports.settleAccount = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const paymentMethod = String(req.body.paymentMethod || "CASH").trim().toUpperCase();
+    const note = String(req.body.note || "").trim() || null;
+    if (!["CASH", "CARD", "TRANSFER"].includes(paymentMethod)) return res.status(400).json({ success: false, message: "Unsupported payment method" });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const customer = await tx.customer.findUnique({ where: { id } });
+      if (!customer) throw Object.assign(new Error("Customer not found"), { code: "NOT_FOUND" });
+      const currentBalance = customerMoney(customer.accountBalance);
+      if (currentBalance === 0) throw Object.assign(new Error("Customer account is already settled"), { code: "ALREADY_SETTLED" });
+      const amount = Math.abs(currentBalance);
+      const direction = currentBalance > 0 ? "IN" : "OUT";
+      const updated = await tx.customer.update({ where: { id }, data: { accountBalance: 0 } });
+      const openShift = await tx.cashierShift.findFirst({ where: { userId: req.user.id, status: "OPEN" }, orderBy: { openedAt: "desc" } });
+      const transaction = await tx.customerAccountTransaction.create({ data: { customerId: id, userId: req.user.id, type: "SETTLEMENT", amount: -currentBalance, balanceAfter: 0, cashierShiftId: openShift?.id || null, note: note || "Account settlement" } });
+      const expense = direction === "OUT" && openShift ? await tx.shiftExpense.create({ data: { cashierShiftId: openShift.id, userId: req.user.id, amount, category: "CUSTOMER_SETTLEMENT", paymentMethod, note: note || `تصفية حساب العميل ${customer.name}` } }) : null;
+      const treasury = await recordTreasuryTransaction(tx, { type: "CUSTOMER_SETTLEMENT", direction, amount, accountingAccountId: req.body.accountingAccountId, treasuryAccountId: req.body.treasuryAccountId, paymentMethod, note: note || `تصفية حساب العميل ${customer.name}`, referenceType: "CUSTOMER", referenceId: customer.id, referenceNumber: customer.name, userId: req.user.id, cashierShiftId: openShift?.id || null });
+      return { customer: updated, transaction, expense, treasury };
+    });
+    res.json({ success: true, message: "Customer account settled", data: result });
+  } catch (error) {
+    if (error.code === "NOT_FOUND") return res.status(404).json({ success: false, message: error.message });
+    if (error.code === "ALREADY_SETTLED") return res.status(400).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: "Failed to settle customer account", error: error.message });
   }
 };
 

@@ -10,6 +10,203 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
+function transferInclude() {
+  return {
+    sourceBranch: { select: { id: true, name: true, code: true } },
+    destinationBranch: { select: { id: true, name: true, code: true } },
+    createdBy: { select: { id: true, name: true } },
+    items: {
+      include: { medicine: { select: { id: true, name: true, barcode: true, quantity: true } } },
+      orderBy: { id: "asc" }
+    }
+  };
+}
+
+function buildTransferNumber() {
+  return `TRF-${Date.now()}`;
+}
+
+exports.getTransfers = async (req, res) => {
+  try {
+    const status = String(req.query.status || "").trim().toUpperCase();
+    const transfers = await prisma.inventoryTransfer.findMany({
+      where: status ? { status } : undefined,
+      include: transferInclude(),
+      orderBy: { createdAt: "desc" },
+      take: Math.min(200, Math.max(1, Number(req.query.limit || 100)))
+    });
+    res.json({ success: true, data: transfers });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Could not load inventory transfers" });
+  }
+};
+
+exports.createTransfer = async (req, res) => {
+  try {
+    const sourceBranchId = Number(req.body.sourceBranchId);
+    const destinationBranchId = Number(req.body.destinationBranchId);
+    const notes = String(req.body.notes || "").trim() || null;
+    const mergedItems = new Map();
+
+    for (const raw of Array.isArray(req.body.items) ? req.body.items : []) {
+      const medicineId = Number(raw.medicineId);
+      const quantity = Number(raw.quantity);
+      if (!Number.isInteger(medicineId) || !Number.isInteger(quantity) || quantity < 1) continue;
+      mergedItems.set(medicineId, (mergedItems.get(medicineId) || 0) + quantity);
+    }
+
+    if (!sourceBranchId || !destinationBranchId || sourceBranchId === destinationBranchId || !mergedItems.size) {
+      return res.status(400).json({ success: false, message: "Choose two different branches and at least one valid item" });
+    }
+
+    const transfer = await prisma.$transaction(async (tx) => {
+      const branches = await tx.branch.findMany({
+        where: { id: { in: [sourceBranchId, destinationBranchId] }, isActive: true },
+        select: { id: true }
+      });
+      if (branches.length !== 2) throw Object.assign(new Error("Branch not found or inactive"), { code: "INVALID_BRANCH" });
+
+      const medicineIds = [...mergedItems.keys()];
+      const medicines = await tx.medicine.findMany({
+        where: { id: { in: medicineIds } },
+        select: { id: true, name: true, quantity: true }
+      });
+      if (medicines.length !== medicineIds.length) throw Object.assign(new Error("One or more items were not found"), { code: "INVALID_ITEM" });
+
+      for (const medicine of medicines) {
+        if (mergedItems.get(medicine.id) > medicine.quantity) {
+          throw Object.assign(new Error(`${medicine.name}: quantity exceeds the available global stock`), { code: "INSUFFICIENT_STOCK" });
+        }
+      }
+
+      return tx.inventoryTransfer.create({
+        data: {
+          transferNumber: buildTransferNumber(),
+          sourceBranchId,
+          destinationBranchId,
+          createdById: req.user.id,
+          notes,
+          items: { create: [...mergedItems.entries()].map(([medicineId, quantity]) => ({ medicineId, quantity })) }
+        },
+        include: transferInclude()
+      });
+    });
+
+    res.status(201).json({ success: true, message: "Inventory transfer created", data: transfer });
+  } catch (error) {
+    const status = ["INVALID_BRANCH", "INVALID_ITEM", "INSUFFICIENT_STOCK"].includes(error.code) ? 400 : 500;
+    res.status(status).json({ success: false, message: error.message || "Could not create inventory transfer" });
+  }
+};
+
+exports.receiveTransfer = async (req, res) => {
+  try {
+    const transfer = await prisma.$transaction(async (tx) => {
+      const existing = await tx.inventoryTransfer.findUnique({ where: { id: Number(req.params.id) }, include: transferInclude() });
+      if (!existing) throw Object.assign(new Error("Inventory transfer not found"), { code: "NOT_FOUND" });
+      if (existing.status !== "PENDING") throw Object.assign(new Error("This transfer has already been received"), { code: "INVALID_STATUS" });
+
+      await tx.stockMovement.createMany({
+        data: existing.items.flatMap((item) => [
+          {
+            medicineId: item.medicineId,
+            userId: req.user.id,
+            type: "BRANCH_TRANSFER_OUT",
+            quantityChange: 0,
+            quantityAfter: item.medicine.quantity,
+            reason: `تحويل بين الفروع ${existing.transferNumber}`,
+            note: `من ${existing.sourceBranch.name} إلى ${existing.destinationBranch.name}: ${item.quantity}`
+          },
+          {
+            medicineId: item.medicineId,
+            userId: req.user.id,
+            type: "BRANCH_TRANSFER_IN",
+            quantityChange: 0,
+            quantityAfter: item.medicine.quantity,
+            reason: `استلام تحويل بين الفروع ${existing.transferNumber}`,
+            note: `من ${existing.sourceBranch.name} إلى ${existing.destinationBranch.name}: ${item.quantity}`
+          }
+        ])
+      });
+
+      return tx.inventoryTransfer.update({
+        where: { id: existing.id },
+        data: { status: "RECEIVED", receivedAt: new Date() },
+        include: transferInclude()
+      });
+    });
+    res.json({ success: true, message: "Inventory transfer received", data: transfer });
+  } catch (error) {
+    const status = ["NOT_FOUND", "INVALID_STATUS"].includes(error.code) ? (error.code === "NOT_FOUND" ? 404 : 409) : 500;
+    res.status(status).json({ success: false, message: error.message || "Could not receive inventory transfer" });
+  }
+};
+
+exports.getExchanges = async (req, res) => {
+  try {
+    const rows = await prisma.itemExchange.findMany({
+      include: {
+        fromMedicine: { select: { id: true, name: true, quantity: true } },
+        toMedicine: { select: { id: true, name: true, quantity: true } },
+        createdBy: { select: { id: true, name: true } }
+      },
+      orderBy: { createdAt: "desc" },
+      take: 100
+    });
+    res.json({ success: true, data: rows });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not load item exchanges" });
+  }
+};
+
+exports.createExchange = async (req, res) => {
+  try {
+    const fromMedicineId = Number(req.body.fromMedicineId);
+    const toMedicineId = Number(req.body.toMedicineId);
+    const quantityFrom = Number(req.body.quantityFrom);
+    const quantityTo = Number(req.body.quantityTo);
+    const reason = String(req.body.reason || "").trim() || null;
+    if (!fromMedicineId || !toMedicineId || fromMedicineId === toMedicineId || !Number.isInteger(quantityFrom) || !Number.isInteger(quantityTo) || quantityFrom < 1 || quantityTo < 1) {
+      return res.status(400).json({ success: false, message: "Choose two different items and valid quantities" });
+    }
+    const exchange = await prisma.$transaction(async (tx) => {
+      const medicines = await tx.medicine.findMany({ where: { id: { in: [fromMedicineId, toMedicineId] } } });
+      const from = medicines.find((row) => row.id === fromMedicineId);
+      const to = medicines.find((row) => row.id === toMedicineId);
+      if (!from || !to) throw Object.assign(new Error("Item not found"), { code: "NOT_FOUND" });
+      if (from.quantity < quantityFrom) throw Object.assign(new Error("The outgoing quantity is not available"), { code: "INSUFFICIENT_STOCK" });
+      const exchangeNumber = `EXC-${Date.now()}`;
+      if (isFractionalMedicine(from)) {
+        const unitsPerBox = getBaseUnitsPerBox(from);
+        if (quantityFrom % unitsPerBox !== 0) throw Object.assign(new Error("Packaged outgoing items must be exchanged in whole boxes"), { code: "INVALID_PACKAGED_EXCHANGE" });
+        const fullBoxes = await tx.medicineBox.findMany({ where: { medicineId: from.id, status: "OPEN" }, orderBy: { createdAt: "asc" } });
+        const removable = fullBoxes.filter((box) => Number(box.remainingPills) === Number(box.totalPills));
+        const boxesCount = quantityFrom / unitsPerBox;
+        if (removable.length < boxesCount) throw Object.assign(new Error("Not enough unopened boxes to exchange"), { code: "PARTIAL_BOXES_PRESENT" });
+        await tx.medicineBox.deleteMany({ where: { id: { in: removable.slice(0, boxesCount).map((box) => box.id) } } });
+      }
+      if (isFractionalMedicine(to)) {
+        const unitsPerBox = getBaseUnitsPerBox(to);
+        if (quantityTo % unitsPerBox !== 0) throw Object.assign(new Error("Packaged incoming items must be exchanged in whole boxes"), { code: "INVALID_PACKAGED_EXCHANGE" });
+        await createMedicineBoxes(tx, { medicineId: to.id, boxesCount: quantityTo / unitsPerBox, stripsPerBox: to.stripsPerBox, pillsPerStrip: to.pillsPerStrip, batchNumber: to.batchNumber, expiryDate: to.expiryDate });
+      }
+      const [updatedFrom, updatedTo] = await Promise.all([
+        tx.medicine.update({ where: { id: from.id }, data: { quantity: { decrement: quantityFrom } } }),
+        tx.medicine.update({ where: { id: to.id }, data: { quantity: { increment: quantityTo } } })
+      ]);
+      await tx.stockMovement.createMany({ data: [
+        { medicineId: from.id, userId: req.user.id, type: "ITEM_EXCHANGE_OUT", quantityChange: -quantityFrom, quantityAfter: updatedFrom.quantity, reason: `تبادل أصناف ${exchangeNumber}`, note: reason || `إلى ${to.name}` },
+        { medicineId: to.id, userId: req.user.id, type: "ITEM_EXCHANGE_IN", quantityChange: quantityTo, quantityAfter: updatedTo.quantity, reason: `تبادل أصناف ${exchangeNumber}`, note: reason || `من ${from.name}` }
+      ] });
+      return tx.itemExchange.create({ data: { exchangeNumber, fromMedicineId, toMedicineId, quantityFrom, quantityTo, reason, createdById: req.user.id }, include: { fromMedicine: { select: { id: true, name: true, quantity: true } }, toMedicine: { select: { id: true, name: true, quantity: true } }, createdBy: { select: { id: true, name: true } } } });
+    });
+    res.status(201).json({ success: true, data: exchange });
+  } catch (error) {
+    const status = ["NOT_FOUND", "INSUFFICIENT_STOCK", "INVALID_PACKAGED_EXCHANGE", "PARTIAL_BOXES_PRESENT"].includes(error.code) ? 400 : 500;
+    res.status(status).json({ success: false, message: error.message || "Could not exchange items" });
+  }
+};
+
 async function buildInventorySnapshot() {
   const now = new Date();
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -358,6 +555,12 @@ exports.createInventoryCount = async (req, res) => {
       ? [...new Set(req.body.medicineIds.map(Number).filter(Boolean))]
       : [];
     const notes = String(req.body.notes || "").trim() || null;
+    const plannedStart = req.body.plannedStart ? new Date(req.body.plannedStart) : null;
+    const plannedEnd = req.body.plannedEnd ? new Date(req.body.plannedEnd) : null;
+    if ((plannedStart && Number.isNaN(plannedStart.getTime())) || (plannedEnd && Number.isNaN(plannedEnd.getTime())) || (plannedStart && plannedEnd && plannedEnd < plannedStart)) {
+      return res.status(400).json({ success: false, message: "تواريخ فترة الجرد غير صحيحة" });
+    }
+    const branchName = String(req.body.branchName || "").trim() || null;
 
     const medicines = medicineIds.length
       ? await prisma.medicine.findMany({ where: { id: { in: medicineIds } } })
@@ -367,6 +570,9 @@ exports.createInventoryCount = async (req, res) => {
       data: {
         countNumber: buildCountNumber(),
         notes,
+        plannedStart,
+        plannedEnd,
+        branchName,
         createdById: req.user.id,
         items: medicines.length
           ? {
@@ -383,6 +589,19 @@ exports.createInventoryCount = async (req, res) => {
     res.status(201).json({ success: true, message: "Inventory count started", data: count });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to start inventory count" });
+  }
+};
+
+exports.cancelInventoryCount = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const count = await prisma.inventoryCount.findUnique({ where: { id } });
+    if (!count) return res.status(404).json({ success: false, message: "عملية الجرد غير موجودة" });
+    if (count.status !== "OPEN") return res.status(409).json({ success: false, message: "لا يمكن حذف جرد مكتمل" });
+    await prisma.inventoryCount.delete({ where: { id } });
+    res.json({ success: true, data: { id } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "تعذر إلغاء عملية الجرد" });
   }
 };
 

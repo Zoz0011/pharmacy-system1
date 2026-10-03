@@ -1,5 +1,18 @@
 const prisma = require("../config/prisma");
-const { ensureDefaultTreasury, recordTreasuryTransaction } = require("../services/treasuryService");
+const { ensureSystemAccounts } = require("../services/accountingService");
+const { ensureDefaultTreasury, ensurePaymentTreasuries, resolveTreasuryAccount, recordTreasuryTransaction } = require("../services/treasuryService");
+
+exports.getPaymentAccounts = async (req, res) => {
+  try {
+    const data = await prisma.$transaction(async (tx) => {
+      await ensureSystemAccounts(tx);
+      return ensurePaymentTreasuries(tx);
+    });
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "تعذر تحميل الخزائن وحسابات الدفع", error: error.message });
+  }
+};
 
 exports.getTreasury = async (req, res) => {
   try {
@@ -7,7 +20,11 @@ exports.getTreasury = async (req, res) => {
     const type = String(req.query.type || "").trim().toUpperCase();
     const direction = String(req.query.direction || "").trim().toUpperCase();
     const result = await prisma.$transaction(async (tx) => {
-      const account = await ensureDefaultTreasury(tx);
+      await ensureSystemAccounts(tx);
+      await ensurePaymentTreasuries(tx);
+      const account = (req.query.accountingAccountId || req.query.treasuryAccountId)
+        ? await resolveTreasuryAccount(tx, req.query)
+        : await ensureDefaultTreasury(tx);
       const where = {
         treasuryAccountId: account.id,
         ...(type ? { type } : {}),
@@ -18,10 +35,13 @@ exports.getTreasury = async (req, res) => {
         tx.treasuryTransaction.aggregate({ where: { treasuryAccountId: account.id, direction: "IN" }, _sum: { amount: true } }),
         tx.treasuryTransaction.aggregate({ where: { treasuryAccountId: account.id, direction: "OUT" }, _sum: { amount: true } })
       ]);
+      const accountingAccount = account.accountingAccountId ? await tx.accountingAccount.findUnique({ where: { id: account.accountingAccountId }, select: { balance: true, name: true, accountNumber: true } }) : null;
+      const effectiveBalance = Number(account.balance || 0) + Number(accountingAccount?.balance || 0);
       return {
-        account,
+        account: { ...account, balance: effectiveBalance, accountingAccount },
+        accounts: await ensurePaymentTreasuries(tx),
         summary: {
-          balance: Number(account.balance || 0),
+          balance: effectiveBalance,
           totalIncome: Number(income._sum.amount || 0),
           totalExpenses: Number(expenses._sum.amount || 0)
         },
@@ -47,6 +67,8 @@ exports.createAdjustment = async (req, res) => {
       direction,
       amount,
       paymentMethod: String(req.body.paymentMethod || "CASH"),
+      accountingAccountId: req.body.accountingAccountId,
+      treasuryAccountId: req.body.treasuryAccountId,
       note,
       userId: req.user.id
     }));

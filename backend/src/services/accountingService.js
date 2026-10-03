@@ -2,8 +2,11 @@ const prisma = require("../config/prisma");
 const { toMoney } = require("./treasuryService");
 
 const SYSTEM_ACCOUNTS = [
-  { systemKey: "MAIN_CASH", accountNumber: "1001", name: "الصندوق الرئيسي", accountType: "ASSET", subType: "CURRENT_ASSET", nature: "DEBIT" },
-  { systemKey: "BANK", accountNumber: "1002", name: "حساب البنك", accountType: "ASSET", subType: "CURRENT_ASSET", nature: "DEBIT" },
+  { systemKey: "MAIN_CASH", accountNumber: "1001", name: "الصندوق الرئيسي", accountType: "ASSET", subType: "CASH", nature: "DEBIT", isPaymentAccount: true },
+  { systemKey: "BANK", accountNumber: "1002", name: "حساب البنك / فيزا", accountType: "ASSET", subType: "BANK", nature: "DEBIT", isPaymentAccount: true },
+  { systemKey: "PRIVATE_CASH", accountNumber: "1003", name: "خزينة خاصة", accountType: "ASSET", subType: "CASH", nature: "DEBIT", isPaymentAccount: true },
+  { systemKey: "BANK_TRANSFERS", accountNumber: "1004", name: "حسابات التحويلات البنكية", accountType: "ASSET", subType: "BANK_TRANSFER", nature: "DEBIT", isPaymentAccount: true },
+  { systemKey: "CASHIER_DRAWER", accountNumber: "1005", name: "درج الكاشير الرئيسي", accountType: "ASSET", subType: "CASH_DRAWER", nature: "DEBIT", isPaymentAccount: true },
   { systemKey: "RECEIVABLES", accountNumber: "1101", name: "المدينون (العملاء)", accountType: "ASSET", subType: "CURRENT_ASSET", nature: "DEBIT" },
   { systemKey: "INVENTORY", accountNumber: "1201", name: "مخزون آخر المدة", accountType: "ASSET", subType: "CURRENT_ASSET", nature: "DEBIT" },
   { systemKey: "PAYABLES", accountNumber: "2001", name: "الدائنون (الموردون)", accountType: "LIABILITY", subType: "CURRENT_LIABILITY", nature: "CREDIT" },
@@ -31,6 +34,19 @@ async function ensureSystemAccounts(tx = prisma) {
   for (const definition of SYSTEM_ACCOUNTS) {
     const existing = await tx.accountingAccount.findFirst({ where: { systemKey: definition.systemKey } });
     if (!existing) await tx.accountingAccount.create({ data: definition });
+    else if (definition.isPaymentAccount) {
+      await tx.accountingAccount.update({
+        where: { id: existing.id },
+        data: {
+          name: definition.name,
+          accountType: definition.accountType,
+          subType: definition.subType,
+          nature: definition.nature,
+          isPaymentAccount: true,
+          active: true
+        }
+      });
+    }
   }
   return tx.accountingAccount.findMany({ orderBy: [{ accountNumber: "asc" }, { id: "asc" }] });
 }
@@ -105,7 +121,7 @@ async function getSnapshot(query = {}) {
     prisma.supplier.findMany({ select: { openingBalance: true } }),
     prisma.shiftExpense.findMany({ where: { createdAt: { gte: range.from, lte: range.to }, NOT: { category: "SUPPLIER_PAYMENT" } } }),
     prisma.treasuryAccount.findMany(),
-    prisma.treasuryTransaction.findMany({ where: { createdAt: { gte: range.from, lte: range.to } }, orderBy: { createdAt: "desc" } }),
+    prisma.treasuryTransaction.findMany({ where: { createdAt: { gte: range.from, lte: range.to } }, include: { treasuryAccount: { include: { accountingAccount: { select: { id: true, name: true, accountNumber: true } } } } }, orderBy: { createdAt: "desc" } }),
     prisma.accountingAccount.findMany({ orderBy: [{ accountNumber: "asc" }, { id: "asc" }] })
   ]);
 
@@ -118,8 +134,9 @@ async function getSnapshot(query = {}) {
   const purchaseDue = toMoney(purchases.filter((invoice) => invoice.status !== "RETURNED" && invoice.paymentStatus !== "PAID").reduce((sum, invoice) => sum + Number(invoice.totalAmount || 0), 0) + suppliers.reduce((sum, supplier) => sum + Math.max(0, Number(supplier.openingBalance || 0)), 0));
   const receivables = toMoney(customers.reduce((sum, customer) => sum + Math.max(0, Number(customer.accountBalance || 0)), 0));
   const inventory = toMoney(medicines.reduce((sum, medicine) => sum + medicineStockValue(medicine), 0));
-  const cash = toMoney(treasuryAccounts.reduce((sum, account) => sum + Number(account.balance || 0), 0));
-  const operatingExpenses = toMoney(expenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0));
+  const cash = toMoney(treasuryAccounts.reduce((sum, account) => sum + Number(account.balance || 0), 0) + accounts.filter((account) => account.active && account.isPaymentAccount).reduce((sum, account) => sum + Number(account.balance || 0), 0));
+  const employeePayments = treasuryTransactions.filter((row) => row.type === "EMPLOYEE_PAYMENT").reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const operatingExpenses = toMoney(expenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0) + employeePayments);
   const costOfGoodsSold = toMoney(sales.reduce((sum, sale) => {
     const original = Number(sale.finalAmount || 0);
     const returned = Math.max(Number(sale.refundedAmount || 0), sale.status === "RETURNED" ? original : 0);
@@ -128,8 +145,14 @@ async function getSnapshot(query = {}) {
   }, 0));
   const grossProfit = toMoney(netSales - costOfGoodsSold);
   const netProfit = toMoney(grossProfit - operatingExpenses);
+  const linkedTreasuryBalances = new Map();
+  let legacyTreasuryBalance = 0;
+  treasuryAccounts.forEach((treasuryAccount) => {
+    if (treasuryAccount.accountingAccountId) linkedTreasuryBalances.set(treasuryAccount.accountingAccountId, Number(treasuryAccount.balance || 0));
+    else legacyTreasuryBalance += Number(treasuryAccount.balance || 0);
+  });
   const operationalBalances = {
-    MAIN_CASH: cash,
+    MAIN_CASH: legacyTreasuryBalance,
     BANK: 0,
     RECEIVABLES: receivables,
     INVENTORY: inventory,
@@ -144,7 +167,7 @@ async function getSnapshot(query = {}) {
   };
   const decoratedAccounts = accounts.map((account) => ({
     ...account,
-    effectiveBalance: toMoney(Number(account.balance || 0) + Number(operationalBalances[account.systemKey] || 0))
+    effectiveBalance: toMoney(Number(account.balance || 0) + Number(linkedTreasuryBalances.get(account.id) || 0) + Number(operationalBalances[account.systemKey] || 0))
   }));
   return {
     range,

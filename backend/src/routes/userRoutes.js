@@ -11,6 +11,7 @@ router.get("/roles", controller.getRoleOptions);
 router.get("/", controller.getUsers);
 router.post("/", controller.createUser);
 router.put("/:id", controller.updateUser);
+router.post("/:id/payments", controller.recordEmployeePayment);
 router.patch("/:id/password", controller.resetUserPassword);
 router.delete("/:id", controller.deleteUser);
 

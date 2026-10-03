@@ -7,7 +7,7 @@ function toMoney(value) {
 
 function shiftInclude() {
   return {
-    user: { select: { id: true, name: true, role: true } },
+    user: { select: { id: true, name: true, email: true, role: true } },
     expenses: {
       select: { id: true, category: true, amount: true, paymentMethod: true, note: true, createdAt: true, user: { select: { id: true, name: true } } },
       orderBy: { createdAt: "desc" }
@@ -24,6 +24,7 @@ function shiftInclude() {
         finalAmount: true,
         refundedAmount: true,
         paymentMethod: true,
+        payments: { select: { paymentMethod: true, amount: true }, orderBy: { id: "asc" } },
         status: true,
         createdAt: true,
         items: {
@@ -70,16 +71,29 @@ function summarizeShift(shift) {
       result.invoiceCount += 1;
       result.grossSales += Number(sale.finalAmount || 0);
       result.refunds += Number(sale.refundedAmount || 0);
-      if (sale.paymentMethod === "CASH") {
-        result.cashSales += Number(sale.finalAmount || 0);
-        result.cashRefunds += Number(sale.refundedAmount || 0);
-      } else if (sale.paymentMethod === "CARD") {
-        result.cardSales += Number(sale.finalAmount || 0) - Number(sale.refundedAmount || 0);
-      } else if (sale.paymentMethod === "CREDIT") {
-        result.creditSales += Number(sale.finalAmount || 0) - Number(sale.refundedAmount || 0);
-      } else {
-        result.otherSales += Number(sale.finalAmount || 0) - Number(sale.refundedAmount || 0);
-      }
+      const paymentParts = sale.payments?.length
+        ? sale.payments
+        : [{ paymentMethod: sale.paymentMethod, amount: sale.finalAmount }];
+      const refundRatio = Number(sale.finalAmount || 0) > 0
+        ? Math.min(1, Number(sale.refundedAmount || 0) / Number(sale.finalAmount || 0))
+        : 0;
+      paymentParts.forEach((payment) => {
+        const amount = Number(payment.amount || 0);
+        const refunded = amount * refundRatio;
+        if (payment.paymentMethod === "CASH") {
+          result.cashSales += amount;
+          result.cashRefunds += refunded;
+        } else if (payment.paymentMethod === "CARD") {
+          result.cardSales += amount;
+          result.cardRefunds += refunded;
+        } else if (payment.paymentMethod === "CREDIT") {
+          result.creditSales += amount;
+          result.creditRefunds += refunded;
+        } else {
+          result.otherSales += amount;
+          result.otherRefunds += refunded;
+        }
+      });
 
       sale.items.forEach((item) => {
         const key = `${item.medicine.id}:${item.saleUnit}`;
@@ -120,8 +134,11 @@ function summarizeShift(shift) {
       cashSales: 0,
       cashRefunds: 0,
       cardSales: 0,
+      cardRefunds: 0,
       creditSales: 0,
-      otherSales: 0
+      creditRefunds: 0,
+      otherSales: 0,
+      otherRefunds: 0
     }
   );
 
@@ -129,6 +146,10 @@ function summarizeShift(shift) {
     if (key !== "invoiceCount") summary[key] = toMoney(summary[key]);
   });
   summary.netSales = toMoney(summary.grossSales - summary.refunds);
+  summary.netCashSales = toMoney(summary.cashSales - summary.cashRefunds);
+  summary.netCardSales = toMoney(summary.cardSales - summary.cardRefunds);
+  summary.netCreditSales = toMoney(summary.creditSales - summary.creditRefunds);
+  summary.netOtherSales = toMoney(summary.otherSales - summary.otherRefunds);
   const expenses = shift.expenses || [];
   summary.totalExpenses = toMoney(expenses.reduce((total, expense) => total + Number(expense.amount || 0), 0));
   summary.cashExpenses = toMoney(expenses.filter((expense) => expense.paymentMethod === "CASH").reduce((total, expense) => total + Number(expense.amount || 0), 0));
@@ -136,7 +157,9 @@ function summarizeShift(shift) {
   summary.transferExpenses = toMoney(expenses.filter((expense) => expense.paymentMethod === "TRANSFER").reduce((total, expense) => total + Number(expense.amount || 0), 0));
   summary.customerPayments = toMoney((shift.customerTransactions || []).reduce((total, transaction) => total + Math.abs(Number(transaction.amount || 0)), 0));
   summary.supplierPayments = toMoney(expenses.filter((expense) => expense.category === "SUPPLIER_PAYMENT").reduce((total, expense) => total + Number(expense.amount || 0), 0));
-  summary.expectedCash = toMoney(Number(shift.openingCash || 0) + summary.cashSales - summary.cashRefunds + summary.customerPayments - summary.cashExpenses);
+  summary.cashSupplierPayments = toMoney(expenses.filter((expense) => expense.category === "SUPPLIER_PAYMENT" && expense.paymentMethod === "CASH").reduce((total, expense) => total + Number(expense.amount || 0), 0));
+  summary.cashOperatingExpenses = toMoney(summary.cashExpenses - summary.cashSupplierPayments);
+  summary.expectedCash = toMoney(Number(shift.openingCash || 0) + summary.cashSales - summary.cashRefunds + summary.customerPayments - summary.cashOperatingExpenses - summary.cashSupplierPayments);
   summary.soldItems = Array.from(soldItemsMap.values()).map((item) => ({
     ...item,
     total: toMoney(item.total),
@@ -189,6 +212,8 @@ exports.addExpense = async (req, res) => {
         type: category === "SUPPLIER_PAYMENT" ? "SUPPLIER_PAYMENT" : "EXPENSE",
         direction: "OUT",
         amount,
+        accountingAccountId: req.body.accountingAccountId,
+        treasuryAccountId: req.body.treasuryAccountId,
         paymentMethod,
         note: note || `مصروف ${category}`,
         referenceType: "SHIFT_EXPENSE",

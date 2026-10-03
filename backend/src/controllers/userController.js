@@ -1,5 +1,7 @@
 const bcrypt = require("bcryptjs");
 const prisma = require("../config/prisma");
+const { recordTreasuryTransaction, toMoney } = require("../services/treasuryService");
+const { getUserPermissions, normalizePermissions, withUserPermissions } = require("../config/permissions");
 
 const ROLES = ["ADMIN", "PHARMACIST", "CASHIER"];
 
@@ -10,6 +12,7 @@ function sanitizeUser(user) {
     email: user.email,
     username: user.username,
     role: user.role,
+    permissions: getUserPermissions(user),
     phone: user.phone,
     alternatePhone: user.alternatePhone,
     telephone: user.telephone,
@@ -36,7 +39,7 @@ function parseCustomFields(value) {
   try { return value ? JSON.parse(value) : {}; } catch { return {}; }
 }
 
-function normalizeEmployeePayload(body = {}) {
+function normalizeEmployeePayload(body = {}, existingCustomFields = null) {
   const data = {};
   const textFields = ["name", "username", "email", "phone", "alternatePhone", "telephone", "jobTitle", "department", "nationalId", "addressLine1", "addressLine2", "district", "city", "state", "country", "postalCode"];
   for (const field of textFields) if (body[field] !== undefined) data[field] = String(body[field] || "").trim() || null;
@@ -45,7 +48,12 @@ function normalizeEmployeePayload(body = {}) {
   if (body.salary !== undefined) data.salary = Number(Number(body.salary || 0).toFixed(2));
   if (body.hireDate !== undefined) data.hireDate = body.hireDate ? new Date(body.hireDate) : null;
   if (body.active !== undefined) data.active = Boolean(body.active);
-  if (body.customFields !== undefined) data.customFields = JSON.stringify(body.customFields && typeof body.customFields === "object" ? body.customFields : {});
+  if (body.permissions !== undefined) {
+    const permissions = normalizePermissions(body.permissions);
+    data.permissions = JSON.stringify(permissions);
+    data.customFields = withUserPermissions(body.customFields !== undefined ? JSON.stringify(body.customFields && typeof body.customFields === "object" ? body.customFields : {}) : existingCustomFields, permissions);
+  }
+  else if (body.customFields !== undefined) data.customFields = JSON.stringify(body.customFields && typeof body.customFields === "object" ? body.customFields : {});
   return data;
 }
 
@@ -134,9 +142,10 @@ exports.updateUser = async (req, res) => {
       return res.status(400).json({ success: false, message: "You cannot deactivate your own account" });
     }
 
+    const existingUser = await prisma.user.findUnique({ where: { id }, select: { customFields: true } });
     const user = await prisma.user.update({
       where: { id },
-      data: { ...normalizeEmployeePayload(req.body), name, email: String(email).trim().toLowerCase(), role: normalizeRole(role) }
+      data: { ...normalizeEmployeePayload(req.body, existingUser?.customFields), name, email: String(email).trim().toLowerCase(), role: normalizeRole(role) }
     });
 
     res.json({
@@ -198,6 +207,38 @@ exports.resetUserPassword = async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
     res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+exports.recordEmployeePayment = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const amount = toMoney(req.body.amount);
+    const paymentMethod = String(req.body.paymentMethod || "CASH").trim().toUpperCase();
+    const note = String(req.body.note || "").trim();
+    if (!id || amount <= 0) return res.status(400).json({ success: false, message: "أدخل مبلغ صرف صحيح" });
+    if (!["CASH", "CARD", "TRANSFER"].includes(paymentMethod)) return res.status(400).json({ success: false, message: "طريقة الدفع غير مدعومة" });
+    const data = await prisma.$transaction(async (tx) => {
+      const employee = await tx.user.findUnique({ where: { id } });
+      if (!employee) throw Object.assign(new Error("Employee not found"), { code: "NOT_FOUND" });
+      const treasury = await recordTreasuryTransaction(tx, {
+        type: "EMPLOYEE_PAYMENT",
+        direction: "OUT",
+        amount,
+        accountingAccountId: req.body.accountingAccountId,
+        treasuryAccountId: req.body.treasuryAccountId,
+        paymentMethod,
+        note: note || `صرف مستحقات الموظف ${employee.name}`,
+        referenceType: "EMPLOYEE",
+        referenceId: employee.id,
+        referenceNumber: employee.name,
+        userId: req.user.id
+      });
+      return { employee: sanitizeUser(employee), treasury };
+    });
+    res.status(201).json({ success: true, message: "تم صرف مستحقات الموظف وتسجيلها في الحساب والخزنة", data });
+  } catch (error) {
+    res.status(error.code === "NOT_FOUND" ? 404 : 500).json({ success: false, message: error.code === "NOT_FOUND" ? "الموظف غير موجود" : "تعذر صرف مستحقات الموظف", error: error.message });
   }
 };
 

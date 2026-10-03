@@ -193,7 +193,8 @@ exports.createPurchaseInvoice = async (req, res) => {
               pillSellingPrice: item.pillSellingPrice,
               stripsPerBox: item.stripsPerBox,
               pillsPerStrip: item.pillsPerStrip,
-              quantity: medicine.quantity + item.baseUnits,
+              // فاتورة المورد تضيف إلى الرصيد الحالي ولا تستبدله بالكمية الواردة.
+              quantity: { increment: item.baseUnits },
               minStock: item.minStock,
               expiryDate: item.expiryDate || medicine.expiryDate,
               batchNumber: item.batchNumber ?? medicine.batchNumber,
@@ -281,6 +282,8 @@ exports.createPurchaseInvoice = async (req, res) => {
           type: "PURCHASE",
           direction: "OUT",
           amount: updatedInvoice.totalAmount,
+          accountingAccountId: req.body.accountingAccountId,
+          treasuryAccountId: req.body.treasuryAccountId,
           paymentMethod: String(req.body.paymentMethod || "CASH"),
           note: `سداد فاتورة مشتريات ${updatedInvoice.invoiceNumber}`,
           referenceType: "PURCHASE",
@@ -308,6 +311,139 @@ exports.createPurchaseInvoice = async (req, res) => {
   }
 };
 
+exports.updatePurchaseInvoice = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const invoiceNumber = String(req.body.invoiceNumber || "").trim();
+    const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!id || !invoiceNumber) return res.status(400).json({ success: false, message: "Invoice number is required" });
+    if (!rawItems.length) return res.status(400).json({ success: false, message: "Invoice items are required" });
+
+    const invoice = await prisma.$transaction(async (tx) => {
+      const current = await tx.purchaseInvoice.findUnique({
+        where: { id },
+        include: { items: { include: { medicine: true, medicineBoxes: true } } }
+      });
+      if (!current) throw Object.assign(new Error("Purchase invoice not found"), { code: "NOT_FOUND" });
+      if (current.status === "RETURNED") throw Object.assign(new Error("Returned purchase invoices cannot be edited"), { code: "RETURNED_INVOICE" });
+
+      const requestedIds = rawItems.map((row) => Number(row.id));
+      if (requestedIds.some((itemId) => !itemId) || requestedIds.length !== current.items.length || current.items.some((item) => !requestedIds.includes(item.id))) {
+        throw Object.assign(new Error("The invoice item list cannot be replaced during editing"), { code: "INVALID_ITEM" });
+      }
+
+      let totalAmount = 0;
+      for (const raw of rawItems) {
+        const item = current.items.find((row) => row.id === Number(raw.id));
+        const quantity = Number(raw.quantity);
+        const purchasePrice = Number(raw.purchasePrice);
+        const sellingPrice = Number(raw.sellingPrice);
+        if (!item || !Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(purchasePrice) || purchasePrice < 0 || !Number.isFinite(sellingPrice) || sellingPrice < 0) {
+          throw Object.assign(new Error("Each item needs a positive whole quantity and valid prices"), { code: "INVALID_ITEM" });
+        }
+
+        const liveMedicine = await tx.medicine.findUnique({ where: { id: item.medicineId } });
+        if (!liveMedicine) throw Object.assign(new Error("Medicine not found"), { code: "INVALID_ITEM" });
+        const unitsPerBox = isFractionalMedicine(liveMedicine) ? getBaseUnitsPerBox(liveMedicine) : 1;
+        const nextBaseUnits = quantity * unitsPerBox;
+        const previousBaseUnits = Number(item.baseUnits || item.quantity * unitsPerBox);
+        const baseUnitDelta = nextBaseUnits - previousBaseUnits;
+        const quantityDelta = quantity - Number(item.quantity || 0);
+
+        if (baseUnitDelta < 0 && Number(liveMedicine.quantity || 0) < Math.abs(baseUnitDelta)) {
+          throw Object.assign(new Error(`Cannot reduce ${liveMedicine.name}; part of this purchase has already left stock`), { code: "INVALID_STOCK" });
+        }
+
+        if (isFractionalMedicine(liveMedicine) && quantityDelta < 0) {
+          const removableBoxes = item.medicineBoxes.filter((box) => Number(box.remainingPills) === Number(box.totalPills));
+          if (removableBoxes.length < Math.abs(quantityDelta)) {
+            throw Object.assign(new Error(`Cannot reduce ${liveMedicine.name}; some boxes are already opened`), { code: "INVALID_STOCK" });
+          }
+          await tx.medicineBox.deleteMany({ where: { id: { in: removableBoxes.slice(0, Math.abs(quantityDelta)).map((box) => box.id) } } });
+        }
+
+        const updatedMedicine = await tx.medicine.update({
+          where: { id: item.medicineId },
+          data: {
+            // تعديل الفاتورة يطبق فرق الكمية فقط ويحافظ على كل الرصيد السابق.
+            quantity: { increment: baseUnitDelta },
+            purchasePrice,
+            sellingPrice
+          }
+        });
+
+        if (isFractionalMedicine(liveMedicine) && quantityDelta > 0) {
+          await createMedicineBoxes(tx, {
+            medicineId: item.medicineId,
+            purchaseInvoiceItemId: item.id,
+            boxesCount: quantityDelta,
+            stripsPerBox: liveMedicine.stripsPerBox,
+            pillsPerStrip: liveMedicine.pillsPerStrip,
+            batchNumber: liveMedicine.batchNumber,
+            expiryDate: liveMedicine.expiryDate
+          });
+        }
+
+        if (baseUnitDelta !== 0) {
+          await createStockMovement(tx, {
+            medicineId: item.medicineId,
+            userId: req.user?.id,
+            type: "PURCHASE_EDIT",
+            quantityChange: baseUnitDelta,
+            quantityAfter: updatedMedicine.quantity,
+            reason: "Purchase invoice edited",
+            note: `Edited purchase invoice ${invoiceNumber}`
+          });
+        }
+
+        const totalPrice = Number((quantity * purchasePrice).toFixed(2));
+        totalAmount += totalPrice;
+        await tx.purchaseInvoiceItem.update({
+          where: { id: item.id },
+          data: { quantity, baseUnits: nextBaseUnits, purchasePrice, sellingPrice, totalPrice }
+        });
+      }
+
+      const roundedTotal = Number(totalAmount.toFixed(2));
+      const totalDelta = Number((roundedTotal - Number(current.totalAmount || 0)).toFixed(2));
+      await tx.treasuryTransaction.updateMany({
+        where: { referenceType: "PURCHASE", referenceId: id },
+        data: { referenceNumber: invoiceNumber }
+      });
+      if (current.paymentStatus === "PAID" && totalDelta !== 0) {
+        const originalPayment = await tx.treasuryTransaction.findFirst({
+          where: { referenceType: "PURCHASE", referenceId: id, type: "PURCHASE" },
+          orderBy: { createdAt: "desc" }
+        });
+        await recordTreasuryTransaction(tx, {
+          type: "PURCHASE_EDIT",
+          direction: totalDelta > 0 ? "OUT" : "IN",
+          amount: Math.abs(totalDelta),
+          treasuryAccountId: originalPayment?.treasuryAccountId,
+          paymentMethod: originalPayment?.paymentMethod || "CASH",
+          note: `تسوية تعديل فاتورة مشتريات ${invoiceNumber}`,
+          referenceType: "PURCHASE",
+          referenceId: id,
+          referenceNumber: invoiceNumber,
+          userId: req.user?.id || null
+        });
+      }
+
+      return tx.purchaseInvoice.update({
+        where: { id },
+        data: { invoiceNumber, notes: String(req.body.notes || "").trim() || null, totalAmount: roundedTotal },
+        include: { supplier: true, items: { include: { medicine: true, medicineBoxes: true } } }
+      });
+    });
+
+    res.json({ success: true, message: "Purchase invoice updated", data: invoice });
+  } catch (error) {
+    if (error.code === "P2002") return res.status(400).json({ success: false, message: "Invoice number already exists" });
+    if (["NOT_FOUND", "RETURNED_INVOICE", "INVALID_ITEM", "INVALID_STOCK"].includes(error.code)) return res.status(400).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: "Failed to update purchase invoice", error: error.message });
+  }
+};
+
 exports.updatePaymentStatus = async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -326,6 +462,8 @@ exports.updatePaymentStatus = async (req, res) => {
           type: "PURCHASE",
           direction: "OUT",
           amount: updated.totalAmount,
+          accountingAccountId: req.body.accountingAccountId,
+          treasuryAccountId: req.body.treasuryAccountId,
           paymentMethod: String(req.body.paymentMethod || "CASH"),
           note: `سداد فاتورة مشتريات ${updated.invoiceNumber}`,
           referenceType: "PURCHASE",
@@ -383,7 +521,7 @@ exports.createFreePurchaseReturn = async (req, res) => {
         await tx.purchaseInvoiceItem.create({ data: { purchaseInvoiceId: created.id, medicineId: item.medicine.id, quantity: item.quantity, baseUnits: item.baseUnits, purchasePrice: Number(item.unitPrice.toFixed(2)), sellingPrice: item.medicine.sellingPrice, totalPrice: item.totalPrice } });
         await createStockMovement(tx, { medicineId: item.medicine.id, userId: req.user?.id, type: "FREE_PURCHASE_RETURN", quantityChange: -item.baseUnits, quantityAfter: updated.quantity, reason: "Free purchase return", note: `Free purchase return ${created.invoiceNumber}` });
       }
-      await recordTreasuryTransaction(tx, { type: "FREE_PURCHASE_RETURN", direction: "IN", amount: totalAmount, paymentMethod, note: `مرتجع مشتريات حر ${created.invoiceNumber}`, referenceType: "PURCHASE", referenceId: created.id, referenceNumber: created.invoiceNumber, userId: req.user?.id || null, cashierShiftId: openShift.id });
+      await recordTreasuryTransaction(tx, { type: "FREE_PURCHASE_RETURN", direction: "IN", amount: totalAmount, accountingAccountId: req.body.accountingAccountId, treasuryAccountId: req.body.treasuryAccountId, paymentMethod, note: `مرتجع مشتريات حر ${created.invoiceNumber}`, referenceType: "PURCHASE", referenceId: created.id, referenceNumber: created.invoiceNumber, userId: req.user?.id || null, cashierShiftId: openShift.id });
       return tx.purchaseInvoice.findUnique({ where: { id: created.id }, include: { supplier: true, items: { include: { medicine: true } } } });
     });
     res.status(201).json({ success: true, message: "Free purchase return recorded", data: invoice });
@@ -462,6 +600,8 @@ exports.returnPurchaseInvoice = async (req, res) => {
           type: "PURCHASE_RETURN",
           direction: "IN",
           amount: existingInvoice.totalAmount,
+          accountingAccountId: req.body.accountingAccountId,
+          treasuryAccountId: req.body.treasuryAccountId,
           paymentMethod: String(req.body.paymentMethod || "CASH"),
           note: `مرتجع فاتورة مشتريات ${existingInvoice.invoiceNumber}`,
           referenceType: "PURCHASE",
