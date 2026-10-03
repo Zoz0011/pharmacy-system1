@@ -6,7 +6,7 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  external_node_modules = ["@prisma/client", "@prisma/adapter-libsql", "@libsql/client"]
+  external_node_modules = ["express", "cors", "bcryptjs", "jsonwebtoken", "nodemailer", "@prisma/client", "@prisma/adapter-libsql", "@libsql/client"]
   included_files = ["node_modules/.prisma/client/**"]
 
 [[redirects]]
