@@ -79,6 +79,8 @@ app.get("/", (req, res) => {
   });
 });
 
+app.get("/api/health", (req, res) => res.json({ status: "OK", project: "PharmaCore API" }));
+
 app.use("/api/auth", authRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/medicines", medicineRoutes);

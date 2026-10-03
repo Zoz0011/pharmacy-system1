@@ -12,6 +12,7 @@
     "migrate": "prisma migrate dev",
     "seed": "node prisma/seed.js",
     "snapshot:turso": "node scripts/prepare-turso-import.js",
+    "migrate:turso": "node scripts/migrate-sqlite-to-turso.js",
     "migrate:firestore": "node scripts/migrate-sqlite-to-firestore.js",
     "test": "node test/architecture.test.js"
   },
@@ -25,6 +26,7 @@
   "author": "Ziad Reda",
   "license": "ISC",
   "dependencies": {
+    "@libsql/client": "^0.8.1",
     "@prisma/adapter-libsql": "^6.19.3",
     "@prisma/client": "^6.19.0",
     "bcryptjs": "^3.0.3",
@@ -34,7 +36,8 @@
     "firebase-admin": "^14.3.0",
     "firebase-functions": "^7.3.2",
     "jsonwebtoken": "^9.0.3",
-    "nodemailer": "^9.0.5"
+    "nodemailer": "^9.0.5",
+    "serverless-http": "^3.2.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14",

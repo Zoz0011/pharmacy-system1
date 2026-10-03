@@ -1,0 +1,16 @@
+[build]
+  base = "backend"
+  command = "npm ci && npx prisma generate"
+  publish = "public"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  external_node_modules = ["@prisma/client", "@prisma/adapter-libsql", "@libsql/client"]
+  included_files = ["node_modules/.prisma/client/**"]
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
