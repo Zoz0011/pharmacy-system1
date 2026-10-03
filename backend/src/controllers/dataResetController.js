@@ -5,7 +5,7 @@ const prisma = require("../config/prisma");
 
 const BACKUP_DIR = path.join(__dirname, "../../data-reset-backups");
 const SCOPES = new Set(["customers", "suppliers", "treasury", "accounts", "items", "purchases"]);
-const isCloudRuntime = process.env.USE_FIRESTORE === "true" || Boolean(process.env.FUNCTION_TARGET) || Boolean(process.env.NETLIFY);
+const isCloudRuntime = process.env.USE_FIRESTORE === "true" || Boolean(process.env.FUNCTION_TARGET) || process.env.REQUIRE_REMOTE_DATABASE === "true";
 
 function currentWorkspaceId() {
   const workspaceId = Number(prisma.getWorkspaceId?.());
